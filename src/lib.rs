@@ -16,5 +16,6 @@ pub mod measure;
 pub mod results;
 pub mod runner;
 pub mod scope;
+pub mod state;
 pub mod stats;
 pub mod verdict;
