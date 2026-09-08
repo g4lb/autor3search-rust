@@ -21,7 +21,9 @@ pub const MANIFEST_PATH: &str = "frozen/manifest.json";
 /// source file. Populated by [`crate::freeze::inline_hashes`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineHashes {
-    /// Over the token text of every `#[cfg(test)]`-gated module.
+    /// Over the token text of every item gated by a `test`-mentioning `cfg`
+    /// (most commonly a whole `#[cfg(test)] mod tests { ... }`, but any item
+    /// kind that can carry the attribute counts).
     pub cfg_test: String,
     /// Over every doc-comment line, which is a doctest's whole content.
     pub doc: String,
@@ -270,64 +272,130 @@ pub fn verify(repo_root: &Path, m: &Manifest) -> Result<Vec<String>, FreezeError
     Ok(changed)
 }
 
-/// Hashes the test material inside one source file: every `#[cfg(test)]`-gated
-/// module and every doc comment.
+/// Hashes the test material inside one source file: every item gated by a
+/// `#[cfg(test)]`-mentioning attribute (a whole module, most commonly, but
+/// also a bare `#[cfg(test)] fn` and the like) and every doc comment.
 ///
 /// These cannot be frozen as files, because they live inside the very files
 /// the agent is required to edit — restoring the whole file would erase the
 /// optimization along with the test edit. So they are hashed at baseline and
 /// any change is refused. See the design spec §6.
 ///
-/// The `cfg_test` hash is taken over the module's **token stream**, not its
-/// bytes, so reformatting, re-indenting or moving a test module does not trip
-/// the gate while changing an assertion does. Doc comments are hashed as text,
-/// because a doctest's content *is* its text.
+/// The `cfg_test` hash is taken over each qualifying item's **token stream**,
+/// not its bytes, so reformatting or re-indenting a test module does not trip
+/// the gate while changing an assertion does; the per-item digests are sorted
+/// before being combined, so two independent test items changing places in
+/// the file — not their content, just their order — does not trip it either.
+/// Doc comments are hashed as text, because a doctest's content *is* its
+/// text.
 pub fn inline_hashes(source: &str) -> Result<InlineHashes, String> {
     let file = syn::parse_file(source).map_err(|e| format!("parse source: {e}"))?;
 
-    let mut cfg_test_tokens = String::new();
-    collect_cfg_test(&file.items, &mut cfg_test_tokens);
+    let mut cfg_test_digests = Vec::new();
+    collect_cfg_test(&file.items, &mut cfg_test_digests);
+    cfg_test_digests.sort();
 
     let mut docs = String::new();
     collect_docs(&file.attrs, &mut docs);
     collect_item_docs(&file.items, &mut docs);
 
     Ok(InlineHashes {
-        cfg_test: sha256_bytes(cfg_test_tokens.as_bytes()),
+        cfg_test: sha256_bytes(cfg_test_digests.concat().as_bytes()),
         doc: sha256_bytes(docs.as_bytes()),
     })
 }
 
-/// Whether an attribute is `#[cfg(test)]`.
+/// Whether an attribute is `#[cfg(...)]` with `test` mentioned in a position
+/// that gates *on* being a test build — a bare `#[cfg(test)]`, or `test`
+/// nested inside `all(...)`/`any(...)` at any depth.
+///
+/// This walks the `cfg` predicate structurally rather than substring-matching
+/// its tokens, which matters because `#[cfg(not(test))]` — the attribute for
+/// marking something as *production-only* — contains the literal text `test`
+/// too. A substring check would misclassify it as test material and refuse
+/// any ordinary edit to the code it guards; walking the tree instead lets
+/// `not(...)` suppress whatever is nested inside it, so only a `test` that
+/// actually has to hold for the item to compile counts.
 fn is_cfg_test(attr: &syn::Attribute) -> bool {
     if !attr.path().is_ident("cfg") {
         return false;
     }
-    let mut found = false;
-    // parse_nested_meta walks `cfg(...)`'s contents; `test` may sit inside an
-    // `all(...)`/`any(...)`, and treating any mention of it as test-gated is
-    // the conservative reading for a gate.
-    let _ = attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("test") {
-            found = true;
-        }
-        // Ignore errors from nested lists; presence is all this asks.
-        let _ = meta.input;
-        Ok(())
-    });
-    found || attr.to_token_stream().to_string().contains("test")
+    match attr.parse_args::<syn::Meta>() {
+        Ok(meta) => meta_mentions_test(&meta),
+        // An attribute named `cfg` whose contents don't even parse as a
+        // predicate cannot be `cfg(test)`; the build gate will report the
+        // syntax error properly a moment later.
+        Err(_) => false,
+    }
 }
 
-/// Appends the token text of every `#[cfg(test)]` module, recursing into
-/// ordinary modules so a test module nested inside one is still covered.
-fn collect_cfg_test(items: &[syn::Item], out: &mut String) {
-    for item in items {
-        if let syn::Item::Mod(m) = item {
-            if m.attrs.iter().any(is_cfg_test) {
-                out.push_str(&m.to_token_stream().to_string());
-                out.push('\n');
-                continue;
+/// Whether `meta` — one `cfg(...)` predicate — mentions `test` outside the
+/// scope of a `not(...)`.
+fn meta_mentions_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(p) => p.is_ident("test"),
+        syn::Meta::List(list) => {
+            if list.path.is_ident("not") {
+                // Whatever is nested inside `not(...)` is exactly what must
+                // NOT hold, so a `test` in there marks this as
+                // production-only, not test-gated.
+                return false;
             }
+            if list.path.is_ident("all") || list.path.is_ident("any") {
+                if let Ok(nested) = list.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                ) {
+                    return nested.iter().any(meta_mentions_test);
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// The attributes on any item kind that can carry `#[cfg(test)]`.
+///
+/// `syn::Item` has no attrs accessor shared across variants, so this matches
+/// explicitly; an item kind not listed here (only `Verbatim`, tokens `syn`
+/// itself could not interpret) carries no attributes this function can see,
+/// which is the fail-safe direction: such an item is never mistaken for test
+/// material, but it also can never be *exempted* from a hash by omission.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::ExternCrate(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Macro(i) => &i.attrs,
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::TraitAlias(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Use(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// Collects one digest per item gated by a test-mentioning `cfg`, at any
+/// nesting depth, recursing into ordinary (non-test-gated) modules so a test
+/// item nested inside one is still covered.
+///
+/// Hashing per item rather than concatenating raw token text, and letting the
+/// caller sort the result, is what makes two sibling test items changing
+/// places in the file a no-op: nothing here depends on which one came first.
+fn collect_cfg_test(items: &[syn::Item], out: &mut Vec<String>) {
+    for item in items {
+        if item_attrs(item).iter().any(is_cfg_test) {
+            out.push(sha256_bytes(item.to_token_stream().to_string().as_bytes()));
+            continue;
+        }
+        if let syn::Item::Mod(m) = item {
             if let Some((_, inner)) = &m.content {
                 collect_cfg_test(inner, out);
             }
@@ -729,5 +797,123 @@ mod tests {
             .insert("src/lib.rs".into(), inline_hashes(WITH_INLINE).unwrap());
         fs::remove_file(f.repo.join("src/lib.rs")).unwrap();
         assert_eq!(verify_inline(&f.repo, &m).unwrap(), vec!["src/lib.rs"]);
+    }
+
+    // Regression: a bare `#[cfg(test)]` item outside any `mod` block is just
+    // as much test material as a `#[cfg(test)] mod tests { ... }`, and must
+    // be caught the same way.
+    #[test]
+    fn a_bare_cfg_test_function_changing_changes_the_hash() {
+        const SRC: &str = r#"
+#[cfg(test)]
+fn test_helper() -> i32 { 1 }
+"#;
+        let changed = SRC.replace("{ 1 }", "{ 999 }");
+        assert_ne!(
+            inline_hashes(SRC).unwrap().cfg_test,
+            inline_hashes(&changed).unwrap().cfg_test
+        );
+    }
+
+    #[test]
+    fn a_bare_cfg_test_top_level_test_fn_changing_changes_the_hash() {
+        const SRC: &str = r#"
+#[cfg(test)]
+#[test]
+fn top_level_test() { assert_eq!(1 + 1, 2); }
+"#;
+        let weakened = SRC.replace("assert_eq!(1 + 1, 2);", "assert!(true);");
+        assert_ne!(
+            inline_hashes(SRC).unwrap().cfg_test,
+            inline_hashes(&weakened).unwrap().cfg_test
+        );
+    }
+
+    // Regression: `#[cfg(not(test))]` marks something as production-only. It
+    // contains the literal text "test" too, so a substring check would
+    // wrongly treat ordinary edits to it as changing test material.
+    #[test]
+    fn cfg_not_test_is_not_test_gated() {
+        const SRC: &str = r#"
+#[cfg(not(test))]
+mod production_only {
+    pub fn real_impl() -> i32 { 1 }
+}
+"#;
+        let changed = SRC.replace("{ 1 }", "{ 2 }");
+        assert_eq!(
+            inline_hashes(SRC).unwrap().cfg_test,
+            inline_hashes(&changed).unwrap().cfg_test
+        );
+    }
+
+    // Regression: `test` nested inside `all(...)` or `any(...)` must still
+    // count as test-gated — the conservative reading a gate needs.
+    #[test]
+    fn cfg_all_and_any_with_test_are_still_test_gated() {
+        const ALL_SRC: &str = r#"
+#[cfg(all(test, feature = "x"))]
+fn helper() -> i32 { 1 }
+"#;
+        let all_changed = ALL_SRC.replace("{ 1 }", "{ 2 }");
+        assert_ne!(
+            inline_hashes(ALL_SRC).unwrap().cfg_test,
+            inline_hashes(&all_changed).unwrap().cfg_test
+        );
+
+        const ANY_SRC: &str = r#"
+#[cfg(any(test, foo))]
+fn helper() -> i32 { 1 }
+"#;
+        let any_changed = ANY_SRC.replace("{ 1 }", "{ 2 }");
+        assert_ne!(
+            inline_hashes(ANY_SRC).unwrap().cfg_test,
+            inline_hashes(&any_changed).unwrap().cfg_test
+        );
+    }
+
+    // Regression: two independent `#[cfg(test)]` modules swapping position in
+    // the file must not trip the gate — only their content should. The brief
+    // promises moving a test module is a no-op; with more than one module in
+    // the file, that promise only holds if the per-item digests are combined
+    // order-independently.
+    #[test]
+    fn swapping_two_sibling_cfg_test_modules_does_not_change_the_hash() {
+        const ORIGINAL: &str = r#"
+#[cfg(test)]
+mod tests_a {
+    #[test]
+    fn a() { assert_eq!(1, 1); }
+}
+
+#[cfg(test)]
+mod tests_b {
+    #[test]
+    fn b() { assert_eq!(2, 2); }
+}
+"#;
+        const SWAPPED: &str = r#"
+#[cfg(test)]
+mod tests_b {
+    #[test]
+    fn b() { assert_eq!(2, 2); }
+}
+
+#[cfg(test)]
+mod tests_a {
+    #[test]
+    fn a() { assert_eq!(1, 1); }
+}
+"#;
+        assert_eq!(
+            inline_hashes(ORIGINAL).unwrap().cfg_test,
+            inline_hashes(SWAPPED).unwrap().cfg_test
+        );
+
+        let content_changed = ORIGINAL.replace("assert_eq!(2, 2);", "assert!(true);");
+        assert_ne!(
+            inline_hashes(ORIGINAL).unwrap().cfg_test,
+            inline_hashes(&content_changed).unwrap().cfg_test
+        );
     }
 }
