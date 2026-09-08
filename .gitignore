@@ -1,0 +1,12 @@
+/target
+/autor3search-rust
+
+# The harness's own run artifacts, from dogfooding it on this repository.
+.autor3search/
+results.tsv
+run.log
+
+# Local-only design material: specs, plans, run logs. Never pushed.
+# docs/case-study.md is deliberately NOT ignored — it is published.
+docs/superpowers/
+.superpowers/
