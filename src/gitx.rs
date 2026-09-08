@@ -230,7 +230,10 @@ mod tests {
         git(&r.root, &["commit", "-qam", "second"]);
         let second = head_commit(&r.root).unwrap();
 
-        let wt = r.root.parent().unwrap().join("wt");
+        // Give the worktree its own temporary directory, unique to this test,
+        // so concurrent tests do not collide on a fixed path in system temp.
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt = wt_dir.path().join("wt");
         add_worktree(&r.root, &wt, &first).unwrap();
         assert_eq!(head_commit(&wt).unwrap(), first);
         assert_eq!(fs::read_to_string(wt.join("a.txt")).unwrap(), "one\n");
