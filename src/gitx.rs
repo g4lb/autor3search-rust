@@ -142,6 +142,30 @@ pub fn create_and_checkout_branch(dir: &Path, name: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Checks out an existing branch by name.
+///
+/// Used to put the repository back where it was before
+/// [`create_and_checkout_branch`] moved it, when a run fails partway through
+/// and has to be rolled back.
+pub fn checkout_branch(dir: &Path, name: &str) -> Result<(), String> {
+    git(dir, &["checkout", "-q", name])?;
+    Ok(())
+}
+
+/// Force-deletes a local branch, including one carrying commits not merged
+/// anywhere else.
+///
+/// Used to undo [`create_and_checkout_branch`] on rollback: a failed run may
+/// have left the branch with a commit or two of its own (e.g. from the
+/// freeze step), and an ordinary `git branch -d` refuses to delete those.
+/// Without `-D` here, a rollback could fail to remove the very branch whose
+/// continued existence is what makes a retry misreport "branch already
+/// exists" instead of surfacing the original failure.
+pub fn delete_branch(dir: &Path, name: &str) -> Result<(), String> {
+    git(dir, &["branch", "-D", name])?;
+    Ok(())
+}
+
 /// Adds a detached worktree pinned at `commit`.
 pub fn add_worktree(repo: &Path, path: &Path, commit: &str) -> Result<(), String> {
     let path_str = path.to_string_lossy().into_owned();
@@ -269,6 +293,27 @@ mod tests {
         create_and_checkout_branch(&r.root, "autor3search-rust/t1").unwrap();
         assert!(branch_exists(&r.root, "autor3search-rust/t1").unwrap());
         assert_eq!(current_branch(&r.root).unwrap(), "autor3search-rust/t1");
+    }
+
+    // Rollback needs to leave a repository exactly as it found it: checked
+    // out back on the original branch, and the abandoned run branch gone —
+    // even though it carries a commit of its own that an ordinary `git
+    // branch -d` would refuse to delete.
+    #[test]
+    fn a_branch_can_be_checked_out_away_from_and_then_force_deleted() {
+        let r = repo();
+        create_and_checkout_branch(&r.root, "autor3search-rust/t1").unwrap();
+        fs::write(r.root.join("a.txt"), "two\n").unwrap();
+        git(
+            &r.root,
+            &["commit", "-qam", "unmerged work on the run branch"],
+        );
+
+        checkout_branch(&r.root, "main").unwrap();
+        assert_eq!(current_branch(&r.root).unwrap(), "main");
+
+        delete_branch(&r.root, "autor3search-rust/t1").unwrap();
+        assert!(!branch_exists(&r.root, "autor3search-rust/t1").unwrap());
     }
 
     #[test]

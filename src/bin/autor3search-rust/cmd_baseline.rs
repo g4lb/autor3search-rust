@@ -1,5 +1,6 @@
 use crate::args::Args;
 use autor3search::{config, discover, freeze, gitx, results, scope, state};
+use std::path::Path;
 
 pub fn run(argv: &[String]) -> i32 {
     let args = match Args::parse(argv, &[("C", true), ("tag", true), ("force", false)]) {
@@ -71,18 +72,46 @@ fn baseline(args: &Args) -> Result<String, String> {
     if gitx::branch_exists(&root, &branch)? {
         return Err(format!("branch {branch} already exists — pick a new tag"));
     }
+
+    // Nothing above this line has mutated the repository or written into the
+    // state directory, so nothing above needs a rollback. Everything below
+    // does, and `baseline`'s whole contract is doing it exactly once: a
+    // failure partway through must not leave wreckage that a retry misreads
+    // as a naming collision (the branch or the state directory already
+    // existing) rather than the real problem.
+    let original_branch = gitx::current_branch(&root)?;
     gitx::create_and_checkout_branch(&root, &branch)?;
-    let commit = gitx::head_commit(&root)?;
+
+    freeze_and_pin(&root, &dir, &cfg, &cfg_path, tag, &branch)
+        .map_err(|e| rollback(&root, &dir, &branch, &original_branch, e))
+}
+
+/// Everything `baseline` does once the run branch exists: freezing the
+/// tests that live in their own files, hashing the inline tests that
+/// cannot be, pinning the measurement worktree, and recording the baseline.
+///
+/// Split out from [`baseline`] so its errors can be rolled back as a single
+/// unit by the caller — this function itself never cleans up after its own
+/// failure.
+fn freeze_and_pin(
+    root: &Path,
+    dir: &Path,
+    cfg: &config::Config,
+    cfg_path: &Path,
+    tag: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let commit = gitx::head_commit(root)?;
 
     // Freeze the tests that live in their own files.
-    let frozen = discover::frozen_test_files(&root, &cfg.unfreeze)?;
+    let frozen = discover::frozen_test_files(root, &cfg.unfreeze)?;
     let store = dir.join(freeze::STORE_DIR);
-    let mut manifest = freeze::snapshot(&root, &store, &frozen).map_err(|e| e.to_string())?;
+    let mut manifest = freeze::snapshot(root, &store, &frozen).map_err(|e| e.to_string())?;
 
     // Hash the tests that cannot be: inline #[cfg(test)] modules and doctests
     // inside the source files the agent is allowed to edit.
     let matcher = scope::Matcher::new(&cfg.scope);
-    for rel in discover::in_scope_sources(&root, &matcher)? {
+    for rel in discover::in_scope_sources(root, &matcher)? {
         let text =
             std::fs::read_to_string(root.join(&rel)).map_err(|e| format!("read {rel}: {e}"))?;
         manifest
@@ -93,17 +122,17 @@ fn baseline(args: &Args) -> Result<String, String> {
 
     // Pin the measurement worktree.
     let worktree = dir.join(state::WORKTREE_NAME);
-    gitx::add_worktree(&root, &worktree, &commit)?;
+    gitx::add_worktree(root, &worktree, &commit)?;
 
     let record = state::Baseline {
         tag: tag.to_string(),
-        branch: branch.clone(),
+        branch: branch.to_string(),
         commit: commit.clone(),
         measure_commit: commit.clone(),
         created_at: now_utc(),
         benchmarks: cfg.benchmarks.clone(),
         bench_targets: cfg.bench_targets.clone(),
-        config_sha256: freeze::sha256_file(&cfg_path)?,
+        config_sha256: freeze::sha256_file(cfg_path)?,
     };
     record.save(&dir.join(state::BASELINE_FILE))?;
 
@@ -117,6 +146,48 @@ fn baseline(args: &Args) -> Result<String, String> {
         worktree.display(),
         record.benchmarks.join(", ")
     ))
+}
+
+/// Undoes everything [`freeze_and_pin`] may have partially done: checks the
+/// repository back out onto `original_branch`, force-deletes the abandoned
+/// run branch, and removes the partial state directory. Returns
+/// `original_err`, with any trouble the rollback itself hits appended as
+/// additional context.
+///
+/// The rollback's own failure must never REPLACE `original_err` — whatever
+/// actually broke the run is what the person retrying needs to see first,
+/// not a secondary complaint about cleanup.
+fn rollback(
+    root: &Path,
+    dir: &Path,
+    branch: &str,
+    original_branch: &str,
+    original_err: String,
+) -> String {
+    let mut msg = original_err;
+    if let Err(e) = gitx::checkout_branch(root, original_branch) {
+        msg.push_str(&format!(
+            "\n\nadditionally, failed to check the repository back out onto {original_branch:?} \
+             after this failure: {e}\n    to recover by hand: git checkout {original_branch}"
+        ));
+    }
+    if let Err(e) = gitx::delete_branch(root, branch) {
+        msg.push_str(&format!(
+            "\n\nadditionally, failed to delete the abandoned run branch {branch:?}: {e}\n    \
+             to recover by hand: git branch -D {branch}"
+        ));
+    }
+    if dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            msg.push_str(&format!(
+                "\n\nadditionally, failed to remove the partial state directory {}: {e}\n    \
+                 to recover by hand: rm -rf {}",
+                dir.display(),
+                dir.display()
+            ));
+        }
+    }
+    msg
 }
 
 /// An RFC3339 UTC timestamp, without pulling in a date library for one field.
