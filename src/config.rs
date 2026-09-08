@@ -199,7 +199,8 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     if !value.is_finite() || value < 0.0 {
         return Err(format!("duration {s:?} must be a non-negative number"));
     }
-    Ok(Duration::from_secs_f64(value * unit))
+    Duration::try_from_secs_f64(value * unit)
+        .map_err(|_| format!("duration {s:?} is too large to represent as a Duration"))
 }
 
 #[cfg(test)]
@@ -305,6 +306,13 @@ mod tests {
     }
 
     #[test]
+    fn oversized_durations_are_refused_not_panicked() {
+        // Oversized durations that would panic with from_secs_f64 must return Err instead.
+        assert!(parse_duration("1e300h").is_err());
+        assert!(parse_duration("99999999999999999h").is_err());
+    }
+
+    #[test]
     fn bad_durations_are_refused_by_validate() {
         for bad in ["measurement_time", "warm_up_time", "timeout"] {
             let mut c = Config::default();
@@ -315,6 +323,13 @@ mod tests {
             }
             assert!(c.validate().is_err(), "{bad} must be validated");
         }
+    }
+
+    #[test]
+    fn oversized_timeout_is_refused_by_validate() {
+        let mut c = Config::default();
+        c.timeout = "1e300h".into();
+        assert!(c.validate().is_err());
     }
 
     #[test]
