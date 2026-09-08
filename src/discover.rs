@@ -368,6 +368,81 @@ criterion_main!(all);
     }
 
     #[test]
+    fn bench_targets_workspace_with_same_name_in_multiple_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create a workspace with two members, both declaring a bench target
+        // with the same name but different harness settings
+        let workspace_toml = r#"
+[workspace]
+members = ["member1", "member2"]
+"#;
+        fs::write(root.join("Cargo.toml"), workspace_toml).unwrap();
+
+        // Create member1: criterion bench
+        fs::create_dir(root.join("member1")).unwrap();
+        let member1_cargo = r#"
+[package]
+name = "member1"
+version = "0.1.0"
+edition = "2021"
+
+[[bench]]
+name = "shared_bench"
+harness = false
+"#;
+        fs::write(root.join("member1/Cargo.toml"), member1_cargo).unwrap();
+        fs::create_dir(root.join("member1/src")).unwrap();
+        fs::write(root.join("member1/src/lib.rs"), "pub fn f() {}").unwrap();
+        fs::create_dir(root.join("member1/benches")).unwrap();
+        fs::write(root.join("member1/benches/shared_bench.rs"), "fn main() {}").unwrap();
+
+        // Create member2: libtest bench (default)
+        fs::create_dir(root.join("member2")).unwrap();
+        let member2_cargo = r#"
+[package]
+name = "member2"
+version = "0.1.0"
+edition = "2021"
+
+[[bench]]
+name = "shared_bench"
+"#;
+        fs::write(root.join("member2/Cargo.toml"), member2_cargo).unwrap();
+        fs::create_dir(root.join("member2/src")).unwrap();
+        fs::write(root.join("member2/src/lib.rs"), "pub fn g() {}").unwrap();
+        fs::create_dir(root.join("member2/benches")).unwrap();
+        fs::write(root.join("member2/benches/shared_bench.rs"), "fn main() {}").unwrap();
+
+        // Call bench_targets on the workspace root
+        let targets = bench_targets(root).unwrap();
+
+        // Should return both targets, sorted by (package, target)
+        assert_eq!(
+            targets.len(),
+            2,
+            "both members' bench targets should be found"
+        );
+
+        // Verify first target (member1, should be criterion)
+        assert_eq!(targets[0].package, "member1");
+        assert_eq!(targets[0].target, "shared_bench");
+        assert!(
+            targets[0].is_criterion,
+            "member1's bench should be criterion"
+        );
+
+        // Verify second target (member2, should be libtest)
+        assert_eq!(targets[1].package, "member2");
+        assert_eq!(targets[1].target, "shared_bench");
+        assert!(
+            !targets[1].is_criterion,
+            "member2's bench should be libtest (default harness = true)"
+        );
+    }
+
+    #[test]
     fn bench_targets_distinguishes_criterion_from_libtest() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -441,7 +516,10 @@ edition = "2021"
     fn bench_targets_gracefully_handles_missing_manifest() {
         // Non-existent path should not panic, just return false
         let result = is_criterion_target("/nonexistent/Cargo.toml", "some_bench");
-        assert!(!result, "missing manifest should be treated as not criterion");
+        assert!(
+            !result,
+            "missing manifest should be treated as not criterion"
+        );
     }
 
     #[test]
@@ -454,6 +532,9 @@ edition = "2021"
 
         // Unparseable manifest should not panic, just return false
         let result = is_criterion_target(root.join("Cargo.toml").to_str().unwrap(), "some_bench");
-        assert!(!result, "unparseable manifest should be treated as not criterion");
+        assert!(
+            !result,
+            "unparseable manifest should be treated as not criterion"
+        );
     }
 }
