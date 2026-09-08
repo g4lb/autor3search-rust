@@ -100,14 +100,26 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
 /// Manifest entries come from a JSON file on disk, so they are untrusted
 /// input: `restore` writes through them before every evaluation.
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, FreezeError> {
+    // Rust's non-Windows `Path` parser never treats `\` as a separator, so a
+    // backslash-separated escape (or drive prefix) is not absolute and has no
+    // `..` component here — it is just one literal filename. Reject it
+    // structurally, on every platform, so a manifest written on Windows and
+    // read on Unix (or vice versa) is refused identically rather than one
+    // side silently letting it through only to fail downstream with a
+    // confusing "no such file".
+    if rel.contains('\\') || rel.contains(':') {
+        return Err(FreezeError::Io(format!(
+            "frozen path {rel:?} must use forward slashes and no drive prefix"
+        )));
+    }
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return Err(FreezeError::Io(format!(
             "frozen path {rel:?} must be relative"
         )));
     }
-    // Reject a Windows drive prefix or any climb, on every platform, so the
-    // check means the same thing everywhere.
+    // Reject any climb, on every platform, so the check means the same thing
+    // everywhere.
     for c in rel_path.components() {
         match c {
             Component::Normal(_) | Component::CurDir => {}
@@ -364,6 +376,24 @@ mod tests {
         };
         m.files.insert(abs.into(), "0".repeat(64));
         assert!(restore(&f.repo, &f.store, &m).is_err());
+    }
+
+    // Rust's Unix `Path` parser never treats `\` as a separator, so a
+    // backslash-separated escape or drive prefix is neither absolute nor has
+    // a `..` component there — it must be refused structurally instead, on
+    // every platform, so a manifest written on Windows and read on Unix (or
+    // vice versa) is refused identically.
+    #[test]
+    fn backslash_and_drive_paths_are_refused_on_every_platform() {
+        let f = fixture();
+        for bad in ["C:\\evil.rs", "..\\escape.rs", "a\\..\\..\\escape.rs"] {
+            let mut m = Manifest::default();
+            m.files.insert(bad.into(), "0".repeat(64));
+            assert!(
+                restore(&f.repo, &f.store, &m).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 
     #[cfg(unix)]
