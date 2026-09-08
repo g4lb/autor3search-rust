@@ -45,6 +45,12 @@ pub fn tag_from_branch(branch: &str) -> Option<String> {
         .map(|t| t.to_string())
 }
 
+/// The longest a tag may be. Generous for a run identifier like `sep4` or
+/// `2026-09-08`; exists so an over-long tag fails here with a clean message
+/// instead of surviving validation and failing later at the first real
+/// filesystem write with a raw OS "File name too long" error.
+const MAX_TAG_LEN: usize = 64;
+
 /// Validates a run tag against a strict allow-list: letters, digits, `.`, `_`
 /// and `-`.
 ///
@@ -59,6 +65,11 @@ pub fn valid_tag(tag: &str) -> Result<(), String> {
     if tag == "." || tag == ".." {
         return Err(format!(
             "tag {tag:?} is not allowed: {tag:?} is a directory reference, not a run identifier"
+        ));
+    }
+    if tag.len() > MAX_TAG_LEN {
+        return Err(format!(
+            "tag {tag:?} is not allowed: tags may be at most {MAX_TAG_LEN} characters long"
         ));
     }
     if !tag
@@ -222,6 +233,7 @@ mod tests {
     // be more than one segment: traversal and absolute paths both.
     #[test]
     fn a_tag_may_never_contain_a_path_separator_or_be_a_directory_reference() {
+        let too_long = "a".repeat(MAX_TAG_LEN + 1);
         for t in [
             "",
             ".",
@@ -232,6 +244,7 @@ mod tests {
             "/abs",
             "has space",
             "sep4;rm",
+            too_long.as_str(),
         ] {
             assert!(valid_tag(t).is_err(), "{t:?} must be refused");
         }
@@ -258,12 +271,28 @@ mod tests {
     /// variable in between.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Removes `STATE_HOME_ENV` on drop, including during a panic unwind, so
+    /// a test that fails inside `with_home`'s closure never leaks the
+    /// variable into whatever test acquires `ENV_LOCK` next.
+    struct ClearHomeOnDrop;
+
+    impl Drop for ClearHomeOnDrop {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(STATE_HOME_ENV) };
+        }
+    }
+
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        // The lock protects only `()` — access to the environment variable,
+        // not any invariant a panicking test could corrupt — so a poisoned
+        // lock (left by a *different* test that panicked while holding it)
+        // is still safe to use. Without this, one genuine test failure would
+        // turn into a PoisonError panic in every other env-var test that
+        // runs after it, obscuring which test actually found the bug.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var(STATE_HOME_ENV, home) };
-        let out = f();
-        unsafe { std::env::remove_var(STATE_HOME_ENV) };
-        out
+        let _clear = ClearHomeOnDrop;
+        f()
     }
 
     #[test]
