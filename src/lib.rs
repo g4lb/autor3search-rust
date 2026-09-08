@@ -8,3 +8,4 @@
 pub const EXIT_USAGE: i32 = 64;
 
 pub mod config;
+pub mod stats;
