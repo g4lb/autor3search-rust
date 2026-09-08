@@ -13,6 +13,7 @@ pub mod discover;
 pub mod freeze;
 pub mod gitx;
 pub mod measure;
+pub mod pipeline;
 pub mod results;
 pub mod runner;
 pub mod scope;

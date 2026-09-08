@@ -95,7 +95,20 @@ pub fn changed_since(dir: &Path, commit: &str) -> Result<Vec<String>, String> {
     //   - Most entries: XY path\0 (where XY are two status columns)
     //   - Renames: XY new_path\0 old_path\0
     // We want the NEW path for renames, so we take the first path field after status.
-    let status_output = git_raw(dir, &["status", "--porcelain", "-z"])?;
+    //
+    // --untracked-files=all is load-bearing, not cosmetic: by default `git
+    // status` collapses a brand-new, entirely untracked directory into one
+    // entry naming just the directory (e.g. `.cargo/`), never the files
+    // inside it. A caller matching individual paths against locked-file and
+    // scope rules would then see a directory name that matches no rule at
+    // all — silently admitting, say, a freshly created `.cargo/config.toml`
+    // that was never diffed against anything. Listing every file
+    // individually is what makes a new file just as visible as a modified
+    // one.
+    let status_output = git_raw(
+        dir,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )?;
     let status_str = String::from_utf8(status_output)
         .map_err(|e| format!("git status output is not UTF-8: {e}"))?;
     let fields: Vec<&str> = status_str.split('\0').collect();
@@ -284,6 +297,26 @@ mod tests {
         changed.sort();
         // Exact set equality: only the two changed files, nothing extra.
         assert_eq!(changed, vec!["a.txt", "untracked.rs"], "{changed:?}");
+    }
+
+    // A caller matches every path against locked-file and scope rules
+    // individually, so a brand-new, entirely untracked DIRECTORY must report
+    // the file inside it, not just the directory's own name — `git status`
+    // collapses the latter by default, which would let a new file inside a
+    // new directory (a `.cargo/config.toml` an agent just created, say) match
+    // no rule at all and pass unnoticed.
+    #[test]
+    fn changed_since_reports_files_inside_a_new_untracked_directory() {
+        let r = repo();
+        let base = head_commit(&r.root).unwrap();
+        fs::create_dir_all(r.root.join(".cargo")).unwrap();
+        fs::write(r.root.join(".cargo/config.toml"), "[build]\n").unwrap();
+        let changed = changed_since(&r.root, &base).unwrap();
+        assert_eq!(
+            changed,
+            vec![".cargo/config.toml"],
+            "must name the file, not just the new directory: {changed:?}"
+        );
     }
 
     #[test]
