@@ -9,5 +9,6 @@ pub const EXIT_USAGE: i32 = 64;
 
 pub mod bench;
 pub mod config;
+pub mod freeze;
 pub mod stats;
 pub mod verdict;
