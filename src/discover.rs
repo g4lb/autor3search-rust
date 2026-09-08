@@ -11,8 +11,9 @@ pub struct BenchTargetInfo {
     pub target: String,
     pub src_path: PathBuf,
     /// Whether it declares `harness = false`, i.e. is a criterion target.
-    /// Ordinary libtest targets do not accept criterion's flags, so
-    /// measurement must never invoke them.
+    /// This is read from the `[[bench]]` table in the package's Cargo.toml.
+    /// An ordinary libtest targets have `harness = true` (the default) and do not
+    /// accept criterion's flags, so measurement must never invoke them.
     pub is_criterion: bool,
 }
 
@@ -27,6 +28,7 @@ struct MetaPackage {
     id: String,
     name: String,
     targets: Vec<MetaTarget>,
+    manifest_path: String,
 }
 
 #[derive(Deserialize)]
@@ -34,8 +36,58 @@ struct MetaTarget {
     name: String,
     kind: Vec<String>,
     src_path: String,
+}
+
+#[derive(Deserialize)]
+struct CargoManifest {
+    bench: Option<Vec<BenchEntry>>,
+}
+
+#[derive(Deserialize)]
+struct BenchEntry {
+    name: String,
     #[serde(default)]
     harness: Option<bool>,
+}
+
+/// Determine if a bench target is a criterion target by reading its Cargo.toml.
+/// Returns true if the target has `harness = false`, false otherwise.
+/// If the manifest cannot be read or parsed, returns false and logs via comment why.
+fn is_criterion_target(manifest_path: &str, target_name: &str) -> bool {
+    // Try to read and parse the Cargo.toml file
+    let manifest_content = match std::fs::read_to_string(manifest_path) {
+        Ok(content) => content,
+        Err(_) => {
+            // If we cannot read the manifest, treat as not criterion to avoid aborting
+            // discovery. The measurement phase will fail gracefully if this assumption
+            // is wrong, so silently assuming is acceptable here.
+            return false;
+        }
+    };
+
+    let manifest: CargoManifest = match toml::from_str(&manifest_content) {
+        Ok(m) => m,
+        Err(_) => {
+            // If we cannot parse the manifest, treat as not criterion.
+            // Again, discovery should not abort on unparseable manifests.
+            return false;
+        }
+    };
+
+    // Look for a [[bench]] entry with matching name
+    if let Some(benches) = manifest.bench {
+        for bench in benches {
+            if bench.name == target_name {
+                // Found explicit [[bench]] entry; check harness field
+                // Default is harness = true (not criterion)
+                return bench.harness == Some(false);
+            }
+        }
+    }
+
+    // No explicit [[bench]] entry found. This bench target was auto-discovered
+    // from benches/*.rs by cargo, which defaults to harness = true (libtest).
+    false
 }
 
 /// Lists every bench target in the workspace via `cargo metadata`.
@@ -71,8 +123,7 @@ pub fn bench_targets(root: &Path) -> Result<Vec<BenchTargetInfo>, String> {
                 package: pkg.name.clone(),
                 target: t.name.clone(),
                 src_path: PathBuf::from(&t.src_path),
-                // cargo reports harness: false explicitly; the default is true.
-                is_criterion: t.harness == Some(false),
+                is_criterion: is_criterion_target(&pkg.manifest_path, &t.name),
             });
         }
     }
@@ -246,7 +297,14 @@ criterion_main!(all);
     fn repo() -> Repo {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        for d in ["src", "tests", "benches", "target/debug", "src/deep"] {
+        for d in [
+            "src",
+            "tests",
+            "benches",
+            "target/debug",
+            "src/deep",
+            ".dotdir",
+        ] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
         fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
@@ -254,6 +312,7 @@ criterion_main!(all);
         fs::write(root.join("tests/it.rs"), "#[test] fn t() {}\n").unwrap();
         fs::write(root.join("benches/b.rs"), BENCH_SRC).unwrap();
         fs::write(root.join("target/debug/generated.rs"), "pub fn x() {}\n").unwrap();
+        fs::write(root.join(".dotdir/hidden.rs"), "pub fn z() {}\n").unwrap();
         fs::write(root.join("README.md"), "not rust\n").unwrap();
         Repo { _dir: dir, root }
     }
@@ -286,6 +345,16 @@ criterion_main!(all);
             !sources.iter().any(|s| s.starts_with("target/")),
             "{sources:?}"
         );
+        assert!(
+            !sources.iter().any(|s| s.starts_with(".dotdir/")),
+            "{sources:?}"
+        );
+
+        let frozen = frozen_test_files(&r.root, &[]).unwrap();
+        assert!(
+            !frozen.iter().any(|s| s.starts_with(".dotdir/")),
+            "{frozen:?}"
+        );
     }
 
     #[test]
@@ -296,5 +365,95 @@ criterion_main!(all);
             in_scope_sources(&r.root, &m).unwrap(),
             vec!["src/deep/m.rs", "src/lib.rs"]
         );
+    }
+
+    #[test]
+    fn bench_targets_distinguishes_criterion_from_libtest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create a minimal Cargo.toml with both harness = false and harness = true benches
+        let cargo_toml = r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bench]]
+name = "criterion_bench"
+harness = false
+
+[[bench]]
+name = "libtest_bench"
+harness = true
+"#;
+        fs::write(root.join("Cargo.toml"), cargo_toml).unwrap();
+
+        // Create benches directory with source files
+        fs::create_dir(root.join("benches")).unwrap();
+        fs::write(
+            root.join("benches/criterion_bench.rs"),
+            "fn main() { println!(\"criterion\"); }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("benches/libtest_bench.rs"),
+            "fn main() { println!(\"libtest\"); }",
+        )
+        .unwrap();
+
+        // Test that is_criterion_target correctly reads from Cargo.toml
+        assert!(
+            is_criterion_target(root.join("Cargo.toml").to_str().unwrap(), "criterion_bench"),
+            "harness = false should be criterion"
+        );
+        assert!(
+            !is_criterion_target(root.join("Cargo.toml").to_str().unwrap(), "libtest_bench"),
+            "harness = true should not be criterion"
+        );
+    }
+
+    #[test]
+    fn bench_targets_with_no_explicit_entry_defaults_to_libtest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create a Cargo.toml with NO [[bench]] entries
+        let cargo_toml = r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+"#;
+        fs::write(root.join("Cargo.toml"), cargo_toml).unwrap();
+
+        // An auto-discovered bench target (no [[bench]] entry) defaults to libtest
+        assert!(
+            !is_criterion_target(
+                root.join("Cargo.toml").to_str().unwrap(),
+                "any_auto_discovered_bench"
+            ),
+            "auto-discovered bench should default to libtest (harness = true)"
+        );
+    }
+
+    #[test]
+    fn bench_targets_gracefully_handles_missing_manifest() {
+        // Non-existent path should not panic, just return false
+        let result = is_criterion_target("/nonexistent/Cargo.toml", "some_bench");
+        assert!(!result, "missing manifest should be treated as not criterion");
+    }
+
+    #[test]
+    fn bench_targets_gracefully_handles_unparseable_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create an invalid TOML file
+        fs::write(root.join("Cargo.toml"), "invalid [[ toml").unwrap();
+
+        // Unparseable manifest should not panic, just return false
+        let result = is_criterion_target(root.join("Cargo.toml").to_str().unwrap(), "some_bench");
+        assert!(!result, "unparseable manifest should be treated as not criterion");
     }
 }
