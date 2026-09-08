@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
 mod args;
+mod cmd_baseline;
 mod cmd_init;
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -51,6 +52,7 @@ fn dispatch(args: &[String]) -> i32 {
     let rest = &args[1..];
     match name.as_str() {
         "init" => cmd_init::run(rest),
+        "baseline" => cmd_baseline::run(rest),
         _ => {
             eprintln!("{name}: not implemented yet");
             autor3search::EXIT_USAGE
