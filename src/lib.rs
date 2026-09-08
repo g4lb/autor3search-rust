@@ -11,6 +11,7 @@ pub mod bench;
 pub mod config;
 pub mod discover;
 pub mod freeze;
+pub mod measure;
 pub mod runner;
 pub mod scope;
 pub mod stats;
