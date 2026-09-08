@@ -42,17 +42,27 @@ impl Matcher {
     /// so this is the gate refusing to depend on that staying true.
     pub fn matches(&self, rel: &str) -> bool {
         let rel = rel.replace('\\', "/");
+        // Reject absolute paths (starting with '/') and drive letters (containing ':').
+        // The ':' rejection also rejects legal Unix filenames like "src/weird:name.rs",
+        // but this fails closed rather than opening a bypass route.
         if rel.starts_with('/') || rel.contains(':') {
             return false;
         }
         if rel == ".." || rel.starts_with("../") || rel.split('/').any(|c| c == "..") {
             return false;
         }
+        // Reject empty or whitespace-only paths, since Pattern::new("**").matches("") is true
+        // and we treat blank patterns as matching nothing on defensive grounds.
+        if rel.trim().is_empty() {
+            return false;
+        }
         let rel = rel.strip_prefix("./").unwrap_or(&rel);
 
         for (pattern_str, pattern) in &self.patterns {
             if pattern.matches(rel) {
-                // For patterns with "*" but not "**", restrict to immediate children
+                // For patterns with "*" but not "**", restrict to immediate children.
+                // The glob crate's "*" crosses "/" (unlike shell/gitignore semantics), so
+                // "src/*" would match "src/deep/nested.rs" without this depth guard.
                 if pattern_str.contains('*') && !pattern_str.contains("**") {
                     // Count slashes in the pattern vs the matched path
                     let pattern_depth = pattern_str.matches('/').count();
@@ -102,21 +112,26 @@ pub fn locked_file(rel: &str) -> Option<&'static str> {
     let rel = rel.replace('\\', "/");
     let file_name = rel.rsplit('/').next().unwrap_or(&rel);
 
-    if file_name == "Cargo.toml" || file_name == "Cargo.lock" {
+    if file_name.eq_ignore_ascii_case("Cargo.toml") || file_name.eq_ignore_ascii_case("Cargo.lock")
+    {
         return Some(
             "dependency and build-profile changes are a human decision, not an autonomous one, \
              and would change what is being measured rather than how fast it runs",
         );
     }
-    if (file_name == "config" || file_name == "config.toml")
-        && rel.rsplit('/').nth(1) == Some(".cargo")
+    if (file_name.eq_ignore_ascii_case("config") || file_name.eq_ignore_ascii_case("config.toml"))
+        && rel
+            .rsplit('/')
+            .nth(1)
+            .is_some_and(|d| d.eq_ignore_ascii_case(".cargo"))
     {
         return Some(
             "it sets compiler flags: an agent could add -C target-cpu=native and post a real \
              speedup having changed no logic at all",
         );
     }
-    if rel == "rust-toolchain" || rel == "rust-toolchain.toml" {
+    if rel.eq_ignore_ascii_case("rust-toolchain") || rel.eq_ignore_ascii_case("rust-toolchain.toml")
+    {
         return Some("it selects the toolchain that compiles both sides of the measurement");
     }
     None
@@ -228,5 +243,33 @@ mod tests {
                 .unwrap()
                 .contains("toolchain")
         );
+    }
+
+    #[test]
+    fn locked_files_are_matched_case_insensitively() {
+        for p in [
+            "cargo.toml",
+            "CARGO.TOML",
+            "crates/x/cargo.toml",
+            "cargo.lock",
+            "Cargo.LOCK",
+            ".CARGO/config",
+            ".cargo/CONFIG.TOML",
+            "a/b/.Cargo/config.toml",
+            "Rust-Toolchain.toml",
+            "RUST-TOOLCHAIN",
+        ] {
+            assert!(
+                locked_file(p).is_some(),
+                "{p:?} must be locked regardless of case"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_path_is_never_in_scope() {
+        let m = Matcher::new(&["**".to_string()]);
+        assert!(!m.matches(""));
+        assert!(!m.matches("   "));
     }
 }
