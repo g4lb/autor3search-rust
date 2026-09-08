@@ -6,6 +6,7 @@
 //! metric depends on, so they must live where the agent being measured cannot
 //! reach them.
 
+use quote::ToTokens;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -269,6 +270,148 @@ pub fn verify(repo_root: &Path, m: &Manifest) -> Result<Vec<String>, FreezeError
     Ok(changed)
 }
 
+/// Hashes the test material inside one source file: every `#[cfg(test)]`-gated
+/// module and every doc comment.
+///
+/// These cannot be frozen as files, because they live inside the very files
+/// the agent is required to edit — restoring the whole file would erase the
+/// optimization along with the test edit. So they are hashed at baseline and
+/// any change is refused. See the design spec §6.
+///
+/// The `cfg_test` hash is taken over the module's **token stream**, not its
+/// bytes, so reformatting, re-indenting or moving a test module does not trip
+/// the gate while changing an assertion does. Doc comments are hashed as text,
+/// because a doctest's content *is* its text.
+pub fn inline_hashes(source: &str) -> Result<InlineHashes, String> {
+    let file = syn::parse_file(source).map_err(|e| format!("parse source: {e}"))?;
+
+    let mut cfg_test_tokens = String::new();
+    collect_cfg_test(&file.items, &mut cfg_test_tokens);
+
+    let mut docs = String::new();
+    collect_docs(&file.attrs, &mut docs);
+    collect_item_docs(&file.items, &mut docs);
+
+    Ok(InlineHashes {
+        cfg_test: sha256_bytes(cfg_test_tokens.as_bytes()),
+        doc: sha256_bytes(docs.as_bytes()),
+    })
+}
+
+/// Whether an attribute is `#[cfg(test)]`.
+fn is_cfg_test(attr: &syn::Attribute) -> bool {
+    if !attr.path().is_ident("cfg") {
+        return false;
+    }
+    let mut found = false;
+    // parse_nested_meta walks `cfg(...)`'s contents; `test` may sit inside an
+    // `all(...)`/`any(...)`, and treating any mention of it as test-gated is
+    // the conservative reading for a gate.
+    let _ = attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("test") {
+            found = true;
+        }
+        // Ignore errors from nested lists; presence is all this asks.
+        let _ = meta.input;
+        Ok(())
+    });
+    found || attr.to_token_stream().to_string().contains("test")
+}
+
+/// Appends the token text of every `#[cfg(test)]` module, recursing into
+/// ordinary modules so a test module nested inside one is still covered.
+fn collect_cfg_test(items: &[syn::Item], out: &mut String) {
+    for item in items {
+        if let syn::Item::Mod(m) = item {
+            if m.attrs.iter().any(is_cfg_test) {
+                out.push_str(&m.to_token_stream().to_string());
+                out.push('\n');
+                continue;
+            }
+            if let Some((_, inner)) = &m.content {
+                collect_cfg_test(inner, out);
+            }
+        }
+    }
+}
+
+/// Appends every doc-comment line's text.
+fn collect_docs(attrs: &[syn::Attribute], out: &mut String) {
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            {
+                out.push_str(&s.value());
+                out.push('\n');
+            }
+        }
+    }
+}
+
+/// Walks every item that can carry a doc comment, recursing into modules and
+/// impl blocks.
+fn collect_item_docs(items: &[syn::Item], out: &mut String) {
+    for item in items {
+        match item {
+            syn::Item::Fn(i) => collect_docs(&i.attrs, out),
+            syn::Item::Struct(i) => collect_docs(&i.attrs, out),
+            syn::Item::Enum(i) => collect_docs(&i.attrs, out),
+            syn::Item::Trait(i) => collect_docs(&i.attrs, out),
+            syn::Item::Const(i) => collect_docs(&i.attrs, out),
+            syn::Item::Static(i) => collect_docs(&i.attrs, out),
+            syn::Item::Type(i) => collect_docs(&i.attrs, out),
+            syn::Item::Macro(i) => collect_docs(&i.attrs, out),
+            syn::Item::Impl(i) => {
+                collect_docs(&i.attrs, out);
+                for it in &i.items {
+                    if let syn::ImplItem::Fn(f) = it {
+                        collect_docs(&f.attrs, out);
+                    }
+                }
+            }
+            syn::Item::Mod(m) => {
+                collect_docs(&m.attrs, out);
+                if let Some((_, inner)) = &m.content {
+                    collect_item_docs(inner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Reports which in-scope source files' inline tests differ from baseline.
+///
+/// A deleted or unreadable file counts as changed: its tests are certainly not
+/// what they were.
+pub fn verify_inline(repo_root: &Path, m: &Manifest) -> Result<Vec<String>, FreezeError> {
+    let mut changed = Vec::new();
+    for (rel, want) in &m.inline {
+        if symlink_component(repo_root, rel)?.is_some() {
+            changed.push(rel.clone());
+            continue;
+        }
+        let path = safe_join(repo_root, rel)?;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            changed.push(rel.clone());
+            continue;
+        };
+        match inline_hashes(&text) {
+            Ok(got) if &got == want => {}
+            // A file that stopped parsing has certainly changed, and the build
+            // gate will report the syntax error properly a moment later.
+            _ => changed.push(rel.clone()),
+        }
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +603,131 @@ mod tests {
         let path = f.store.join("manifest.json");
         m.save(&path).unwrap();
         assert_eq!(Manifest::load(&path).unwrap(), m);
+    }
+
+    const WITH_INLINE: &str = r#"
+/// Adds two numbers.
+///
+/// ```
+/// assert_eq!(demo::add(1, 2), 3);
+/// ```
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn adds() { assert_eq!(add(1, 2), 3); }
+}
+"#;
+
+    #[test]
+    fn hashing_is_stable_for_identical_source() {
+        let a = inline_hashes(WITH_INLINE).unwrap();
+        let b = inline_hashes(WITH_INLINE).unwrap();
+        assert_eq!(a, b);
+        assert!(!a.cfg_test.is_empty());
+        assert!(!a.doc.is_empty());
+    }
+
+    // The agent is entitled to edit these files, so ordinary work on the
+    // non-test code must not trip the gate.
+    #[test]
+    fn changing_the_implementation_does_not_change_the_hashes() {
+        let optimized = WITH_INLINE.replace("{ a + b }", "{ a.wrapping_add(b) }");
+        assert_eq!(
+            inline_hashes(WITH_INLINE).unwrap(),
+            inline_hashes(&optimized).unwrap()
+        );
+    }
+
+    // Hashing over parsed tokens, not raw bytes, is what buys this.
+    #[test]
+    fn reformatting_the_test_module_does_not_change_the_cfg_test_hash() {
+        let reformatted = WITH_INLINE.replace(
+            "    fn adds() { assert_eq!(add(1, 2), 3); }",
+            "    fn adds() {\n        assert_eq!(add(1, 2), 3);\n    }",
+        );
+        assert_eq!(
+            inline_hashes(WITH_INLINE).unwrap().cfg_test,
+            inline_hashes(&reformatted).unwrap().cfg_test
+        );
+    }
+
+    #[test]
+    fn weakening_an_assertion_changes_the_cfg_test_hash() {
+        let weakened = WITH_INLINE.replace("assert_eq!(add(1, 2), 3);", "assert!(true);");
+        assert_ne!(
+            inline_hashes(WITH_INLINE).unwrap().cfg_test,
+            inline_hashes(&weakened).unwrap().cfg_test
+        );
+    }
+
+    #[test]
+    fn deleting_the_test_module_changes_the_cfg_test_hash() {
+        let start = WITH_INLINE.find("#[cfg(test)]").unwrap();
+        let deleted = &WITH_INLINE[..start];
+        assert_ne!(
+            inline_hashes(WITH_INLINE).unwrap().cfg_test,
+            inline_hashes(deleted).unwrap().cfg_test
+        );
+    }
+
+    #[test]
+    fn weakening_a_doctest_changes_the_doc_hash() {
+        let weakened = WITH_INLINE.replace(
+            "/// assert_eq!(demo::add(1, 2), 3);",
+            "/// let _ = demo::add(1, 2);",
+        );
+        assert_ne!(
+            inline_hashes(WITH_INLINE).unwrap().doc,
+            inline_hashes(&weakened).unwrap().doc
+        );
+    }
+
+    // A file that does not parse cannot be hashed, and guessing would be
+    // worse than saying so: an unparseable file is reported, not skipped.
+    #[test]
+    fn unparseable_source_is_an_error() {
+        assert!(inline_hashes("fn broken( {").is_err());
+    }
+
+    #[test]
+    fn a_file_with_no_inline_tests_hashes_to_the_empty_marker() {
+        let h = inline_hashes("pub fn f() {}\n").unwrap();
+        let h2 = inline_hashes("pub fn g() -> u8 { 7 }\n").unwrap();
+        assert_eq!(h, h2, "two files with no inline tests must agree");
+    }
+
+    #[test]
+    fn verify_inline_finds_the_changed_file_and_only_that_file() {
+        let f = fixture();
+        fs::create_dir_all(f.repo.join("src")).unwrap();
+        fs::write(f.repo.join("src/lib.rs"), WITH_INLINE).unwrap();
+        fs::write(f.repo.join("src/other.rs"), "pub fn g() {}\n").unwrap();
+
+        let mut m = Manifest::default();
+        for rel in ["src/lib.rs", "src/other.rs"] {
+            let text = fs::read_to_string(f.repo.join(rel)).unwrap();
+            m.inline
+                .insert(rel.to_string(), inline_hashes(&text).unwrap());
+        }
+        assert!(verify_inline(&f.repo, &m).unwrap().is_empty());
+
+        let weakened = WITH_INLINE.replace("assert_eq!(add(1, 2), 3);", "assert!(true);");
+        fs::write(f.repo.join("src/lib.rs"), weakened).unwrap();
+        assert_eq!(verify_inline(&f.repo, &m).unwrap(), vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn verify_inline_reports_a_deleted_source_file() {
+        let f = fixture();
+        fs::create_dir_all(f.repo.join("src")).unwrap();
+        fs::write(f.repo.join("src/lib.rs"), WITH_INLINE).unwrap();
+        let mut m = Manifest::default();
+        m.inline
+            .insert("src/lib.rs".into(), inline_hashes(WITH_INLINE).unwrap());
+        fs::remove_file(f.repo.join("src/lib.rs")).unwrap();
+        assert_eq!(verify_inline(&f.repo, &m).unwrap(), vec!["src/lib.rs"]);
     }
 }
