@@ -1,7 +1,65 @@
 //! Shared fixture for the command-level integration tests.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+
+/// Runs the compiled binary against `repo`, pointed at its own out-of-tree
+/// state home so tests never touch the developer's real cache.
+///
+/// Not every test file that pulls in this module uses it — `cmd_init.rs`
+/// exercises `init` through its own local helper — so it carries
+/// `#[allow(dead_code)]` rather than forcing every importer to silence the
+/// warning itself.
+#[allow(dead_code)]
+pub fn run_cli(repo: &TestRepo, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_autor3search-rust"))
+        .args(args)
+        .arg("-C")
+        .arg(repo.path())
+        .env("AUTOR3SEARCH_RUST_STATE_HOME", repo.state_home())
+        .output()
+        .expect("run command")
+}
+
+/// Runs a git command in `root`, panicking on failure. For test setup only.
+#[allow(dead_code)]
+pub fn git(root: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Locates `repo`'s out-of-tree state directory for `tag` by walking its
+/// state home on disk, rather than calling `autor3search::state::state_dir`
+/// directly.
+///
+/// That function derives the directory from `AUTOR3SEARCH_RUST_STATE_HOME`
+/// in the CURRENT process's environment, which `run_cli` only ever sets for
+/// the child process it spawns. Test threads share one process, so setting
+/// that variable for a direct, in-process call would race against every
+/// other test doing the same thing concurrently on the same global — and
+/// setting it once and leaving it set would make every test depend on
+/// whichever repository happened to set it last. Walking the directory tree
+/// `baseline` already wrote needs no such shared, mutable global, so it is
+/// safe under any test order or thread count.
+#[allow(dead_code)]
+pub fn state_dir(repo: &TestRepo, tag: &str) -> PathBuf {
+    let home = repo.state_home();
+    for entry in std::fs::read_dir(home).expect("state home") {
+        let p = entry.unwrap().path().join(tag);
+        if p.exists() {
+            return p;
+        }
+    }
+    panic!("no state dir for tag {tag:?} under {}", home.display());
+}
 
 pub struct TestRepo {
     _dir: tempfile::TempDir,
@@ -60,6 +118,11 @@ impl TestRepo {
     }
 
     /// A crate with source and tests but no bench target at all.
+    ///
+    /// Only `cmd_init.rs` uses this today, so every other test crate that
+    /// pulls in this module sees it as unused; `#[allow(dead_code)]` for the
+    /// same reason as `run_cli` and `git` above.
+    #[allow(dead_code)]
     pub fn without_benchmarks() -> TestRepo {
         let (dir, root, state) = Self::new_repo();
         std::fs::create_dir_all(root.join("src")).unwrap();
