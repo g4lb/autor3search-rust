@@ -24,6 +24,26 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Helper that returns git output without whole-blob trimming.
+/// Used for commands with multi-line output that is parsed positionally (e.g., porcelain format),
+/// where a leading space is significant and must not be eaten by trim().
+fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
 /// The repository root containing `dir`.
 pub fn root(dir: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?))
@@ -57,21 +77,49 @@ pub fn is_clean(dir: &Path) -> Result<bool, String> {
 /// The uncommitted half matters: without it an agent could edit out of scope
 /// and simply not commit before calling eval.
 pub fn changed_since(dir: &Path, commit: &str) -> Result<Vec<String>, String> {
-    let mut paths: Vec<String> = git(dir, &["diff", "--name-only", commit])?
-        .lines()
-        .map(|s| s.to_string())
-        .collect();
-    for line in git(dir, &["status", "--porcelain"])?.lines() {
-        // Porcelain v1: two status characters, a space, then the path. A
-        // rename reads "old -> new"; the new path is what matters here.
-        let path = line.get(3..).unwrap_or("").trim();
-        let path = path.rsplit(" -> ").next().unwrap_or(path);
-        let path = path.trim_matches('"');
+    let mut paths: Vec<String> = Vec::new();
+
+    // Committed changes: use -z to avoid quoting and escaping issues with non-ASCII paths.
+    // Split on NUL and drop the final empty entry.
+    let diff_output = git_raw(dir, &["diff", "--name-only", "-z", commit])?;
+    let diff_str =
+        String::from_utf8(diff_output).map_err(|e| format!("git diff output is not UTF-8: {e}"))?;
+    for path in diff_str.split('\0') {
         if !path.is_empty() {
             paths.push(path.to_string());
         }
     }
-    paths.retain(|p| !p.is_empty());
+
+    // Uncommitted and untracked changes: use -z format to avoid quoting and escaping.
+    // Format with -z is:
+    //   - Most entries: XY path\0 (where XY are two status columns)
+    //   - Renames: XY new_path\0 old_path\0
+    // We want the NEW path for renames, so we take the first path field after status.
+    let status_output = git_raw(dir, &["status", "--porcelain", "-z"])?;
+    let status_str = String::from_utf8(status_output)
+        .map_err(|e| format!("git status output is not UTF-8: {e}"))?;
+    let fields: Vec<&str> = status_str.split('\0').collect();
+    let mut i = 0;
+    while i < fields.len() {
+        let field = fields[i];
+        if field.len() < 3 {
+            i += 1;
+            continue;
+        }
+        // First 3 characters are status codes (2 columns + space).
+        let path = &field[3..];
+        if !path.is_empty() {
+            paths.push(path.to_string());
+        }
+        // For a rename, the old path is the next field; skip it.
+        let status = &field[0..2];
+        if status.contains('R') || status.contains('C') {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -208,9 +256,10 @@ mod tests {
         let base = head_commit(&r.root).unwrap();
         fs::write(r.root.join("a.txt"), "dirty\n").unwrap();
         fs::write(r.root.join("untracked.rs"), "fn f() {}\n").unwrap();
-        let changed = changed_since(&r.root, &base).unwrap();
-        assert!(changed.contains(&"a.txt".to_string()), "{changed:?}");
-        assert!(changed.contains(&"untracked.rs".to_string()), "{changed:?}");
+        let mut changed = changed_since(&r.root, &base).unwrap();
+        changed.sort();
+        // Exact set equality: only the two changed files, nothing extra.
+        assert_eq!(changed, vec!["a.txt", "untracked.rs"], "{changed:?}");
     }
 
     #[test]
@@ -241,5 +290,117 @@ mod tests {
         checkout_detached(&wt, &second).unwrap();
         assert_eq!(head_commit(&wt).unwrap(), second);
         assert_eq!(fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
+    }
+
+    // Regression test for bug 1: leading space eaten by trim() caused spurious paths.
+    // A single unstaged edit should report exactly that file, no phantom entry.
+    #[test]
+    fn changed_since_unstaged_edit_no_phantom_entry() {
+        let r = repo();
+        let base = head_commit(&r.root).unwrap();
+        // Modify the tracked file but do not stage it (unstaged-only = " M a.txt").
+        fs::write(r.root.join("a.txt"), "modified\n").unwrap();
+        let mut changed = changed_since(&r.root, &base).unwrap();
+        changed.sort();
+        // Before the fix, the leading space was eaten by trim(), yielding ".txt" as a phantom.
+        assert_eq!(changed, vec!["a.txt"], "exact match; no phantom paths");
+    }
+
+    // Regression test for bug 2: non-ASCII paths with quoting/escaping.
+    // A file with non-ASCII characters should be parsed correctly on both halves.
+    #[test]
+    fn changed_since_non_ascii_path_matches_exactly() {
+        let r = repo();
+        let base = head_commit(&r.root).unwrap();
+
+        // Create a file with non-ASCII characters.
+        let naive_path = r.root.join("naïve.txt");
+        fs::write(&naive_path, "content\n").unwrap();
+
+        // File is both committed-since and currently dirty: modify it.
+        git(&r.root, &["add", "-A"]);
+        git(&r.root, &["commit", "-qm", "add naïve"]);
+        fs::write(&naive_path, "modified\n").unwrap();
+
+        let mut changed = changed_since(&r.root, &base).unwrap();
+        changed.sort();
+
+        // Must report the file exactly once, with the correct name (not escaped).
+        assert_eq!(changed.len(), 1, "exactly one file changed");
+        assert_eq!(changed[0], "naïve.txt", "path matches on-disk name");
+
+        // The returned path should be openable with File::open(repo_root.join(path)).
+        let _ = fs::read_to_string(r.root.join(&changed[0]))
+            .expect("returned path should open the real file");
+    }
+
+    // Regression test: multiple change types with complex scenarios.
+    // Renames, deletions, staged, unstaged, untracked all mixed.
+    #[test]
+    fn changed_since_complex_scenario_exact_set() {
+        let r = repo();
+        let base = head_commit(&r.root).unwrap();
+
+        // Create initial files for manipulation.
+        fs::write(r.root.join("tracked.txt"), "v1\n").unwrap();
+        fs::write(r.root.join("to_delete.txt"), "delete me\n").unwrap();
+        fs::write(r.root.join("to_rename.txt"), "rename me\n").unwrap();
+        git(&r.root, &["add", "-A"]);
+        git(&r.root, &["commit", "-qm", "initial"]);
+
+        // Now create a complex state:
+        // 1. Modify tracked.txt (unstaged)
+        fs::write(r.root.join("tracked.txt"), "v2\n").unwrap();
+        // 2. Stage a new file
+        fs::write(r.root.join("staged_new.txt"), "new staged\n").unwrap();
+        git(&r.root, &["add", "staged_new.txt"]);
+        // 3. Create an untracked file
+        fs::write(r.root.join("untracked.txt"), "untracked\n").unwrap();
+        // 4. Delete to_delete.txt and stage the deletion
+        fs::remove_file(r.root.join("to_delete.txt")).unwrap();
+        git(&r.root, &["add", "to_delete.txt"]);
+        // 5. Rename to_rename.txt and stage the rename
+        fs::rename(r.root.join("to_rename.txt"), r.root.join("renamed.txt")).unwrap();
+        git(&r.root, &["add", "-A"]);
+
+        let mut changed = changed_since(&r.root, &base).unwrap();
+        changed.sort();
+
+        // Expected: tracked.txt (modified, unstaged), staged_new.txt (new, staged),
+        // untracked.txt (untracked), to_delete.txt (deleted, staged),
+        // renamed.txt (new path from rename), and NO "to_rename.txt" or "->".
+        let expected = vec![
+            "renamed.txt",
+            "staged_new.txt",
+            "to_delete.txt",
+            "tracked.txt",
+            "untracked.txt",
+        ];
+        assert_eq!(changed, expected, "exact set of changed files");
+        assert!(
+            !changed.iter().any(|p| p.contains("->")),
+            "no '->' in paths"
+        );
+    }
+
+    // Regression test: filename with spaces should be parsed correctly.
+    #[test]
+    fn changed_since_filename_with_spaces() {
+        let r = repo();
+        let base = head_commit(&r.root).unwrap();
+
+        // Create a file with spaces in its name.
+        let spaced_path = r.root.join("has space.txt");
+        fs::write(&spaced_path, "content\n").unwrap();
+
+        let mut changed = changed_since(&r.root, &base).unwrap();
+        changed.sort();
+
+        assert_eq!(changed.len(), 1, "exactly one file");
+        assert_eq!(changed[0], "has space.txt", "spaces are preserved");
+
+        // The path should open the real file.
+        let _ = fs::read_to_string(r.root.join(&changed[0]))
+            .expect("returned path with spaces should open the real file");
     }
 }
