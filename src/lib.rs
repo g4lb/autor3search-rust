@@ -6,3 +6,5 @@
 
 /// Exit code for a usage error. Verdict exit codes live in [`verdict`].
 pub const EXIT_USAGE: i32 = 64;
+
+pub mod config;
