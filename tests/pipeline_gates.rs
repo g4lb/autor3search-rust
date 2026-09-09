@@ -1,7 +1,12 @@
 //! Every gate in the eval pipeline, exercised through the library so a gate
 //! failure is attributable to the gate rather than to a process boundary.
 
-use autor3search::{config, discover, freeze, gitx, pipeline, state, verdict};
+use autor3search::{config, freeze, pipeline, state, verdict};
+// `discover` and `gitx` are used only by
+// `a_repo_reached_through_a_symlinked_ancestor_is_not_tampering`, which is
+// itself `#[cfg(unix)]` (it relies on `std::os::unix::fs::symlink`).
+#[cfg(unix)]
+use autor3search::{discover, gitx};
 use std::path::Path;
 
 mod common;

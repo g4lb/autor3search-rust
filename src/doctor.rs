@@ -191,6 +191,11 @@ fn thermal_throttle_from_pmset(s: &str) -> Check {
 
 /// The severity logic, separated from the syscall so it can be tested
 /// without depending on the real machine's current load.
+///
+/// Unix-only: its only caller, [`load_average`], only exists on unix (there
+/// is no portable `getloadavg` equivalent), so this would otherwise be dead
+/// code on every other platform.
+#[cfg(unix)]
 fn load_average_finding(avg: f64, cpus: f64) -> Check {
     let threshold = 0.5 * cpus;
     let ok = avg <= threshold;
@@ -230,6 +235,10 @@ fn load_average() -> Check {
 
 // --- Disk space ---------------------------------------------------------------
 
+/// Unix-only: its only caller, [`disk_space`], only exists on unix (it is
+/// built on `statvfs`), so this would otherwise be dead code on every other
+/// platform.
+#[cfg(unix)]
 fn disk_space_finding(available_bytes: u64) -> Check {
     let gb = available_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     const MIN_GB_WARN: f64 = 2.0;
@@ -500,22 +509,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_quiet_machine_is_under_the_load_threshold() {
         assert!(load_average_finding(1.0, 8.0).ok);
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_busy_machine_exceeds_the_load_threshold() {
         let c = load_average_finding(7.0, 8.0);
         assert!(!c.ok, "{}", c.detail);
     }
 
     #[test]
+    #[cfg(unix)]
     fn plenty_of_disk_is_ok() {
         assert!(disk_space_finding(10 * 1024 * 1024 * 1024).ok);
     }
 
     #[test]
+    #[cfg(unix)]
     fn low_disk_is_flagged() {
         let c = disk_space_finding(1024 * 1024 * 1024);
         assert!(!c.ok, "{}", c.detail);
