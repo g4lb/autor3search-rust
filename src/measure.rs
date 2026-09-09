@@ -10,9 +10,24 @@
 use crate::bench::{self, Set};
 use crate::config::BenchTarget;
 use crate::runner::Runner;
+use crate::state::CANCEL_REQUESTED;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// A distinguishable error string [`run`]'s caller checks for before falling
+/// through to its ordinary "measurement failed" handling.
+///
+/// A sentinel string rather than a richer error type: `interleave` and
+/// `side` already return a plain `Result<_, String>` used by tests with
+/// bare closures that know nothing about cancellation, and threading a new
+/// enum through that public shape (and every existing caller and test of
+/// it) would be a far bigger change than this one property needs. Matching
+/// on the message is unusual, but the two spots that produce and consume it
+/// are a few lines apart in this module and `pipeline.rs`, so it cannot
+/// drift silently.
+pub const CANCELLED_SENTINEL: &str = "__autor3search_measurement_cancelled__";
 
 /// Runs both sides alternately and accumulates their observations.
 ///
@@ -48,6 +63,15 @@ pub fn interleave(
     let mut cand_set = Set::new();
 
     for i in 0..total {
+        // Checked BETWEEN rounds, not mid-round: `side`'s own subprocess
+        // call already reacts within one poll tick if the flag becomes true
+        // while a round is actually running (see `Runner::cargo`), so this
+        // catches the gap right after a round finishes cleanly and before
+        // committing to another one — no experiment's worth of benchmarking
+        // is ever wasted on a round that will not count.
+        if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return Err(CANCELLED_SENTINEL.to_string());
+        }
         let (b, c) = one_round(i, base, cand)?;
         if warmup && i == 0 {
             continue;
@@ -195,6 +219,9 @@ fn side(
             };
             runner.cargo(&args, inner)?
         };
+        if out.cancelled {
+            return Err(CANCELLED_SENTINEL.to_string());
+        }
         if out.timed_out {
             return Err(format!(
                 "benchmark round timed out after {:?} in {}",
