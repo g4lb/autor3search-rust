@@ -101,7 +101,7 @@ Rust. A compiled harness holds the metric, and the agent cannot reach it.
 | your `tests/**` and `benches/**` files | frozen at baseline, restored before every run | nobody — restored automatically |
 | your `src/**` | whatever is in `scope` | **the agent** |
 | `program.md` | the agent's instructions | **you** |
-| frozen tests, baseline worktree, baseline record | lives outside your repo, under `dirs::cache_dir()` (or `AUTOR3SEARCH_RUST_STATE_HOME`) | nobody — the agent could not reach it even by editing every file in scope |
+| frozen tests, baseline worktree, baseline record | lives outside your repo, under `dirs::cache_dir()` (or `AUTOR3SEARCH_RUST_STATE_HOME`) | nobody — the agent's own edits cannot reach it; a determined agent running as your user still can, so detection here is partial, not a guarantee (see [What the harness enforces](#what-the-harness-enforces)) |
 
 That last row matters: the agent edits the repository, so anything the score
 depends on that *lived* there would be silently writable by the very agent
@@ -203,9 +203,9 @@ up, and you would need to kill it by hand. This is a smaller gap than it
 looks: an external `SIGKILL` aimed at `eval`'s own pid would not reach a
 wedged benchmark grandchild in a separate process group either, so
 escalating the signal buys less than it appears to. **The Windows path
-(`OpenProcess`/`TerminateProcess`) is implemented and exercised by CI, but
-has not been verified on real Windows hardware** as part of this release —
-see [Validation status](#validation-status-stated-exactly).
+(`OpenProcess`/`TerminateProcess`) is compiled by CI on `windows-latest`, but
+never actually executed there, and has not been verified on real Windows
+hardware either** — see [Validation status](#validation-status-stated-exactly).
 
 **Ctrl+C.** Interrupting the agent works too. `eval` handles the signal
 rather than dying under it, which matters more than it sounds: criterion
@@ -223,7 +223,7 @@ special: clear any pending stop and point the agent back at `program.md`.
 |---|---|
 | `init` | Scans the repo with `cargo metadata` and criterion `--list`, and writes `.autor3search/config.yaml` + `program.md`. Refuses to overwrite an existing config without `--force`. |
 | `doctor` | Checks whether this machine can measure reliably (CPU frequency scaling, thermal throttling risk, load average, disk space, on-battery, `CARGO_INCREMENTAL`, a `[profile.bench]` override, a nightly default toolchain) and prints its findings. Informational — always exits 0. |
-| `baseline --tag <tag>` | Creates the run branch `autor3search-rust/<tag>`, freezes every in-scope `tests/**`/`benches/**` file and hashes every in-scope `src/**` file's inline tests and doctests, and pins a detached worktree at the baseline commit. Refuses a dirty tree and a reused tag. |
+| `baseline --tag <tag>` | Creates the run branch `autor3search-rust/<tag>`, freezes every in-scope `tests/**`/`benches/**` file, hashes every in-scope `src/**` file's inline tests and doctests, hashes every locked file present on disk, and pins a detached worktree at the baseline commit. Refuses a dirty tree and a reused tag. |
 | `profile` | Runs the declared benchmarks under criterion's `--profile-time` with [samply](https://github.com/mstange/samply) attached, and prints the top self-time symbols — real sampling-profiler data on where time actually goes, rather than an agent guessing from reading source. When samply is not installed, prints how to install it (`cargo install samply`) and exits 0 rather than failing the run. |
 | `eval` | Runs one experiment: gates (scope, locked files, config integrity, restore, inline-test check, frozen-set check, build, test, worktree integrity), measures the candidate against the pinned baseline worktree, scores it, appends a `results.tsv` row, exits `0`/`1`/`2`/`3` for KEEP/DISCARD/FAIL/CRASH, and on `KEEP` re-points the pinned worktree at the candidate's commit so the next `eval` measures against it (see [Scoring](#scoring)). |
 | `status` | Prints where a run is: run branch and whether it is checked out, the frozen baseline commit and the advancing measurement commit, the pinned worktree, how many experiments have run and with what verdicts, and whether a stop is pending. Read-only. Accepts `--tag <tag>` so it works from any branch. |
@@ -391,9 +391,12 @@ An agent optimizing your code can "win" by cheating. Each route is closed:
 | Edit files outside the agreed area | `scope` violations fail before anything is even built |
 | Set `-C target-cpu=native` in `.cargo/config.toml` (or the extensionless `.cargo/config`) | locked outright, regardless of scope — a real, reproducible speedup with no logic change at all, which is not what a run is measuring |
 | Swap or edit a dependency, or the toolchain (`Cargo.toml`/`Cargo.lock`/`rust-toolchain.toml`/`rust-toolchain`) | rejected outright regardless of `scope` — a dependency or toolchain change is a human decision, not an autonomous one, and would change what is being measured rather than how fast it runs |
+| Hide a locked-file edit from the check above by having it fall outside what `git diff`/`git status` report (a repository, or config, that gitignores `Cargo.lock`; an agent editing an in-scope `.gitignore` to add `.cargo/` before creating `.cargo/config.toml`) | every locked path present at baseline is hashed by statting the filesystem directly, independent of git; `eval` recomputes the same hashes and any addition, removal or change is `FAIL(scope_violation)` regardless of what git considers "changed" |
 | Bank measurement noise as a win | a Mann-Whitney test must clear `p < 0.05`; noise is `DISCARD` |
 | Speed up A by wrecking B | any significant regression over 5 % rejects the change outright |
 | Loosen the rules mid-run (raise `max_regress_pct`, narrow `scope`, drop a benchmark) | `.autor3search/config.yaml` is hashed at baseline; any change to it fails the run with a config-hash mismatch |
+| Tamper with the pinned baseline worktree directly (make the *baseline* slower, rather than the candidate faster) | detected when its `HEAD` no longer matches the recorded measurement commit — `FAIL(baseline_tampered)`. **This is detection, not prevention, and it is partial**: the state directory is outside the repo, but the agent runs as the same OS user, so nothing stops it editing the worktree in place — it is only caught if `HEAD` moves |
+| Rewrite the frozen store (the golden copies `restore` reads from, so every later `eval` restores the tampered copy instead of the real one) | detected via the manifest hash recorded at baseline — `FAIL(frozen_store_tampered)`. Unrecoverable for that run, since the reference copy is the thing that was lost; start a fresh run with a new tag |
 | Compare against a stale baseline | the measurement baseline is **re-measured every run**, interleaved with the candidate |
 | Coast to `KEEP` on an earlier improvement doing nothing new | the measurement baseline **advances to the newly kept commit after every `KEEP`** (see [Scoring](#scoring)), so a later no-op is compared against what was just kept, not against where the run started |
 
@@ -542,6 +545,11 @@ useless.
   [What the harness enforces](#what-the-harness-enforces)). An agent that
   edits a `#[cfg(test)]` assertion or a doctest gets a `FAIL` and a wasted
   experiment slot rather than a silent erasure.
+- **Freeze/restore only covers the workspace root's `tests/**` and
+  `benches/**`.** A workspace member's own `crates/foo/tests/**` is not
+  snapshotted or restored, even though `build`/`test`/`measure` all run
+  `--workspace` and so do exercise it. If your `scope` reaches into a
+  member crate, its integration tests are not frozen the way the root's are.
 - **An agent can still buy speed with `unsafe`, and this release does not
   stop it.** `get_unchecked` in place of indexing is the cheapest fake win
   available in Rust: it is genuinely faster, it passes every test that
@@ -582,11 +590,18 @@ Two narrower gaps, named rather than glossed over:
   [Watching a run, and stopping it](#watching-a-run-and-stopping-it) above
   for the full explanation and why the residual gap is smaller than it
   looks.
-- **The Windows `stop --force` path is implemented but unverified on real
-  Windows hardware.** CI builds and runs the full test suite on
-  `windows-latest` and exercises this path there, but no one has watched it
-  work against a real, long-running benchmark on a physical or
-  interactively-used Windows machine as part of this release.
+- **The Windows `stop --force` path is compiled by CI but never executed by
+  it, and is unverified on real Windows hardware.** CI builds the full test
+  suite on `windows-latest`, so the `OpenProcess`/`TerminateProcess` code
+  compiles there — but the only test that calls into it
+  (`stop_force_aborts_an_in_flight_eval_and_writes_no_results_row`) is
+  `#[ignore]`d, because it runs a real, slow benchmark, and CI never passes
+  `--ignored`. So CI never actually executes this path, on any platform, let
+  alone verifies it on Windows specifically. Adding an `--ignored` CI job is
+  not the fix: each ignored test does a full release build and would make CI
+  unusably slow. Nor has anyone watched this path work against a real,
+  long-running benchmark on a physical or interactively-used Windows
+  machine, as part of this release.
 
 ## Repos with no benchmarks
 
