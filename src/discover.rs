@@ -2,6 +2,7 @@
 
 use crate::scope::Matcher;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// One cargo bench target, package-qualified.
@@ -90,12 +91,14 @@ fn is_criterion_target(manifest_path: &str, target_name: &str) -> bool {
     false
 }
 
-/// Lists every bench target in the workspace via `cargo metadata`.
+/// Runs `cargo metadata --no-deps` and parses it. Shared by [`bench_targets`]
+/// and [`workspace_manifest_paths`] so there is one place that knows how to
+/// invoke it.
 ///
 /// `--no-deps` keeps this to the workspace's own packages, and metadata is
 /// produced without compiling anything, so this works on a tree whose
 /// benchmarks do not currently build.
-pub fn bench_targets(root: &Path) -> Result<Vec<BenchTargetInfo>, String> {
+fn cargo_metadata(root: &Path) -> Result<Metadata, String> {
     let out = std::process::Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
@@ -107,8 +110,28 @@ pub fn bench_targets(root: &Path) -> Result<Vec<BenchTargetInfo>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let meta: Metadata =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("parse cargo metadata: {e}"))?;
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse cargo metadata: {e}"))
+}
+
+/// Every workspace member's manifest path, as `cargo metadata` reports it.
+///
+/// Used by [`locked_files`] to stat each member's `Cargo.toml` directly,
+/// belt-and-braces alongside the generic filesystem walk: a member reached
+/// only through a symlinked directory is a member `cargo` itself will happily
+/// build from, so the locked-file check must see its manifest too.
+fn workspace_manifest_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let meta = cargo_metadata(root)?;
+    Ok(meta
+        .packages
+        .iter()
+        .filter(|p| meta.workspace_members.contains(&p.id))
+        .map(|p| PathBuf::from(&p.manifest_path))
+        .collect())
+}
+
+/// Lists every bench target in the workspace via `cargo metadata`.
+pub fn bench_targets(root: &Path) -> Result<Vec<BenchTargetInfo>, String> {
+    let meta = cargo_metadata(root)?;
 
     let mut found = Vec::new();
     for pkg in &meta.packages {
@@ -243,21 +266,70 @@ fn skip_dir_for_locked(name: &str) -> bool {
     name == "target" || name == ".git"
 }
 
-fn walk_locked(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), String> {
+/// How deep [`walk_locked`] will recurse before giving up. A backstop for
+/// when the cycle guard below cannot help — e.g. `canonicalize` failing on a
+/// component it cannot resolve (permission denied, a dangling link in the
+/// middle of the chain) — not a limit any real repository should approach.
+const MAX_LOCKED_WALK_DEPTH: usize = 64;
+
+/// Recurses into `rel`, recording every locked file found.
+///
+/// Uses `std::fs::metadata` rather than `DirEntry::file_type()` to decide
+/// whether an entry is a file or a directory: `file_type()` reports on the
+/// directory entry itself and, by contract, does NOT follow a symlink, so a
+/// symlinked `.cargo` would look like neither a file nor a directory and the
+/// walk would silently skip it — exactly the gap a symlinked locked file (or
+/// locked-file *directory*) exploits. `metadata` follows the link, so a
+/// symlinked `.cargo` is walked into like a real directory and a symlinked
+/// `config.toml` is recorded like a real file, matching what `cargo` itself
+/// sees when it reads these paths at build time.
+///
+/// Following links makes a cycle possible (a symlink pointing at an
+/// ancestor, or at another symlink that loops back), so `seen_dirs` records
+/// the canonicalized form of every directory entered and refuses to enter one
+/// twice; `depth` is a backstop for the rarer case where canonicalization
+/// itself cannot be trusted to catch it.
+fn walk_locked(
+    root: &Path,
+    rel: &Path,
+    out: &mut Vec<String>,
+    seen_dirs: &mut HashSet<PathBuf>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_LOCKED_WALK_DEPTH {
+        return Err(format!(
+            "locked-file walk is over {MAX_LOCKED_WALK_DEPTH} levels deep at {} — a symlink \
+             cycle?",
+            rel.display()
+        ));
+    }
     let dir = root.join(rel);
+    // A directory reached a second time via a different path — most likely a
+    // symlink looping back on an ancestor — is not walked again.
+    if let Ok(canon) = dir.canonicalize() {
+        if !seen_dirs.insert(canon) {
+            return Ok(());
+        }
+    }
     let entries =
         std::fs::read_dir(&dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let child = rel.join(&name);
-        let file_type = entry.file_type().map_err(|e| format!("stat {name}: {e}"))?;
-        if file_type.is_dir() {
+        let child_path = root.join(&child);
+        let meta = match std::fs::metadata(&child_path) {
+            Ok(m) => m,
+            // A dangling symlink, or something removed between the readdir
+            // and this stat: neither is a locked file to record.
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
             if skip_dir_for_locked(&name) {
                 continue;
             }
-            walk_locked(root, &child, out)?;
-        } else if file_type.is_file() {
+            walk_locked(root, &child, out, seen_dirs, depth + 1)?;
+        } else if meta.is_file() {
             let rel_str = child.to_string_lossy().replace('\\', "/");
             if crate::scope::locked_file(&rel_str).is_some() {
                 out.push(rel_str);
@@ -265,6 +337,35 @@ fn walk_locked(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// The fixed, well-known locked locations, checked directly rather than
+/// found by traversal: the root's own `.cargo/config[.toml]` and
+/// `rust-toolchain[.toml]`, plus `Cargo.toml`/`Cargo.lock` at the root and at
+/// every workspace member's manifest path (from `cargo metadata`, which
+/// resolves paths through symlinks itself).
+///
+/// Belt and braces alongside [`walk_locked`]: the walk is generic and finds
+/// anything [`crate::scope::locked_file`] recognises anywhere on disk, but
+/// this list is small, fixed, and does not depend on the walk's traversal
+/// logic — including its symlink handling — being right. `cargo metadata`
+/// failing (no workspace here, or an unparseable manifest — itself possibly
+/// the tampering being gated against) is not fatal to this check: the fixed
+/// root-level paths are still worth statting, so a metadata failure just
+/// means the per-member manifests are not added.
+fn known_locked_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![
+        root.join(".cargo/config.toml"),
+        root.join(".cargo/config"),
+        root.join("rust-toolchain"),
+        root.join("rust-toolchain.toml"),
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+    ];
+    if let Ok(members) = workspace_manifest_paths(root) {
+        out.extend(members);
+    }
+    out
 }
 
 /// Every locked file (see [`crate::scope::locked_file`]) actually present on
@@ -279,8 +380,24 @@ fn walk_locked(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), Str
 /// of whatever git has been told to ignore.
 pub fn locked_files(root: &Path) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    walk_locked(root, Path::new(""), &mut out)?;
+    let mut seen_dirs = HashSet::new();
+    walk_locked(root, Path::new(""), &mut out, &mut seen_dirs, 0)?;
+
+    for path in known_locked_candidates(root) {
+        if std::fs::metadata(&path).is_err() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if crate::scope::locked_file(&rel_str).is_some() {
+            out.push(rel_str);
+        }
+    }
+
     out.sort();
+    out.dedup();
     Ok(out)
 }
 
@@ -597,6 +714,74 @@ edition = "2021"
         fs::create_dir_all(r.root.join(".git/refs")).unwrap();
         fs::write(r.root.join(".git/refs/Cargo.toml"), "decoy\n").unwrap();
         assert!(locked_files(&r.root).unwrap().is_empty());
+    }
+
+    // The security-review finding this walk was rewritten for: `DirEntry::
+    // file_type()` does NOT follow a symlink, so a symlinked `.cargo` used
+    // to look like neither a file nor a directory and the walk silently
+    // skipped it — exactly what let `.cargo/config.toml`'s `rustflags`
+    // through unnoticed. `metadata` (which does follow links) must walk
+    // into it like an ordinary directory and record the config inside.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_locked_directory_is_walked_into_not_skipped() {
+        let r = repo();
+        let elsewhere = r.root.parent().unwrap().join("elsewhere_cargo");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("config.toml"), "[build]\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, r.root.join(".cargo")).unwrap();
+        assert_eq!(locked_files(&r.root).unwrap(), vec![".cargo/config.toml"]);
+    }
+
+    // The locked file itself, not just its containing directory, can be the
+    // link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_locked_file_is_recorded_like_a_real_one() {
+        let r = repo();
+        let elsewhere = r.root.parent().unwrap().join("elsewhere_config.toml");
+        fs::write(&elsewhere, "[build]\n").unwrap();
+        fs::create_dir_all(r.root.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, r.root.join(".cargo/config.toml")).unwrap();
+        assert_eq!(locked_files(&r.root).unwrap(), vec![".cargo/config.toml"]);
+    }
+
+    // Following links makes a cycle possible: a symlink pointing back at an
+    // ancestor of the walk must not recurse forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_does_not_hang_the_walk() {
+        let r = repo();
+        fs::create_dir_all(r.root.join("loop")).unwrap();
+        // "loop/back" points at "loop" itself, one level up from where it
+        // sits — an unbounded walk would recurse into "loop/back/back/..."
+        // forever.
+        std::os::unix::fs::symlink(r.root.join("loop"), r.root.join("loop/back")).unwrap();
+        fs::write(r.root.join("Cargo.toml"), "[package]\n").unwrap();
+        // Must terminate, and must still find the one real locked file.
+        assert_eq!(locked_files(&r.root).unwrap(), vec!["Cargo.toml"]);
+    }
+
+    // A repository legitimately reached through a symlinked ancestor (macOS's
+    // `/tmp`, a home directory on a linked volume) is not tampering: the walk
+    // takes `root` on faith and only examines what is beneath it, so a link
+    // ABOVE `root` must have no effect on what is found.
+    #[cfg(unix)]
+    #[test]
+    fn locked_files_is_unaffected_by_a_symlinked_ancestor_of_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = outer.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = link.join("repo");
+        fs::create_dir_all(root.join(".cargo")).unwrap();
+        fs::write(root.join(".cargo/config.toml"), "[build]\n").unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            locked_files(&root).unwrap(),
+            vec![".cargo/config.toml", "Cargo.toml"]
+        );
     }
 
     #[test]

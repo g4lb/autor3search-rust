@@ -1,7 +1,7 @@
 //! Every gate in the eval pipeline, exercised through the library so a gate
 //! failure is attributable to the gate rather than to a process boundary.
 
-use autor3search::{config, freeze, pipeline, state, verdict};
+use autor3search::{config, discover, freeze, gitx, pipeline, state, verdict};
 use std::path::Path;
 
 mod common;
@@ -88,6 +88,173 @@ fn adding_rustflags_via_cargo_config_fails() {
     let r = eval_now(&repo, cfg, base, &dir);
     assert_eq!(r.reason, verdict::Reason::ScopeViolation);
     assert!(r.message.contains("compiler flags"), "{}", r.message);
+}
+
+// The exact reproduction from the security finding: a symlinked `.cargo`
+// directory. `git status` reports the changed path as `.cargo` alone (a
+// symlink is never recursed into, even with `--untracked-files=all`), so
+// `locked_file(".cargo")` matches nothing (wrong basename) and the `"**"`
+// scope `Matcher` accepts it (glob has no leading-dot restriction) — the
+// edit looks perfectly ordinary right up until `cargo build` follows the
+// link and picks up `rustflags` from a file git never named. The gate must
+// refuse the symlink itself.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_cargo_directory_fails_rather_than_reaching_the_build() {
+    let repo = TestRepo::demo();
+    let (mut cfg, base, dir) = ready(&repo);
+    cfg.scope = vec!["**".to_string()];
+
+    let elsewhere = repo.path().parent().unwrap().join("elsewhere_cargo");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(
+        elsewhere.join("config.toml"),
+        "[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&elsewhere, repo.path().join(".cargo")).unwrap();
+
+    let r = eval_now(&repo, cfg, base, &dir);
+    assert_eq!(r.status, verdict::Status::Fail);
+    assert_eq!(r.reason, verdict::Reason::ScopeViolation);
+    assert!(r.message.contains(".cargo"), "{}", r.message);
+    assert!(
+        r.message.to_lowercase().contains("symlink"),
+        "{}",
+        r.message
+    );
+}
+
+// A symlinked ancestor further from the root than the changed path's final
+// component works the same way: `git status` names only the link
+// (`member`), never the locked file behind it (`member/Cargo.toml`).
+#[cfg(unix)]
+#[test]
+fn a_symlinked_ancestor_directory_of_a_locked_file_fails() {
+    let repo = TestRepo::demo();
+    let (mut cfg, base, dir) = ready(&repo);
+    cfg.scope = vec!["**".to_string()];
+
+    let elsewhere = repo.path().parent().unwrap().join("elsewhere_member");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(
+        elsewhere.join("Cargo.toml"),
+        "[package]\nname = \"decoy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&elsewhere, repo.path().join("member")).unwrap();
+
+    let r = eval_now(&repo, cfg, base, &dir);
+    assert_eq!(r.status, verdict::Status::Fail);
+    assert_eq!(r.reason, verdict::Reason::ScopeViolation);
+    assert!(r.message.contains("member"), "{}", r.message);
+}
+
+// The locked file's own name can be the link rather than an ancestor of it:
+// `.cargo` genuinely a directory, `config.toml` inside it a symlink to
+// somewhere else entirely.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_cargo_config_file_itself_fails() {
+    let repo = TestRepo::demo();
+    let (mut cfg, base, dir) = ready(&repo);
+    cfg.scope = vec!["**".to_string()];
+
+    let elsewhere = repo.path().parent().unwrap().join("elsewhere_config.toml");
+    std::fs::write(
+        &elsewhere,
+        "[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.path().join(".cargo")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, repo.path().join(".cargo/config.toml")).unwrap();
+
+    let r = eval_now(&repo, cfg, base, &dir);
+    assert_eq!(r.status, verdict::Status::Fail);
+    assert_eq!(r.reason, verdict::Reason::ScopeViolation);
+    assert!(r.message.contains(".cargo/config.toml"), "{}", r.message);
+}
+
+// The converse, so the fix cannot over-fire: a repository legitimately
+// reached through a symlinked ancestor (macOS's `/tmp`, a home directory on
+// a linked volume) is not tampering — `freeze.rs` documents the same
+// exception for frozen files, but has no test exercising it either, and
+// `TestRepo::new_repo` canonicalizes its root, so none of this file's other
+// tests exercise it.
+//
+// Deliberately skips `TestRepo`/`ready()` (both of which force a real
+// `cargo build`+`bench --list` through `init`/`baseline`, and the full
+// pipeline through measurement, minutes of wall time for what this test
+// needs to show) and instead builds `pipeline::Options` directly, the same
+// way `pipeline::tests::a_failed_save_rolls_the_worktree_checkout_back`
+// does. An unrelated, fast-failing config edit proves the run got PAST
+// gates 1 and 2b — where the two new symlink checks live — rather than
+// merely never reaching them: if the root's own symlinked ancestor tripped
+// either check, this would fail with `ScopeViolation`, not `ConfigChanged`.
+#[cfg(unix)]
+#[test]
+fn a_repo_reached_through_a_symlinked_ancestor_is_not_tampering() {
+    let outer = tempfile::tempdir().unwrap();
+    let real = outer.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = outer.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let root = link.join("repo"); // deliberately NOT canonicalized
+
+    std::fs::create_dir_all(root.join(".autor3search")).unwrap();
+    common::git(&root, &["init", "-q", "-b", "main"]);
+    common::git(&root, &["config", "user.name", "Test"]);
+    common::git(&root, &["config", "user.email", "test@example.com"]);
+    std::fs::write(
+        root.join(config::CONFIG_PATH),
+        "scope: [\"**\"]\nversion: 1\n",
+    )
+    .unwrap();
+    common::git(&root, &["add", "-A"]);
+    common::git(&root, &["commit", "-qm", "init"]);
+    let commit = gitx::head_commit(&root).unwrap();
+
+    let cfg = config::Config {
+        scope: vec!["**".to_string()],
+        ..config::Config::default()
+    };
+    let locked_files = discover::locked_files(&root).unwrap();
+    let base = state::Baseline {
+        tag: "t1".into(),
+        branch: "autor3search-rust/t1".into(),
+        commit: commit.clone(),
+        measure_commit: commit,
+        created_at: String::new(),
+        benchmarks: Vec::new(),
+        bench_targets: Vec::new(),
+        config_sha256: freeze::sha256_file(&root.join(config::CONFIG_PATH)).unwrap(),
+        locked_files: locked_files
+            .into_iter()
+            .map(|rel| {
+                let hash = freeze::sha256_file(&root.join(&rel)).unwrap();
+                (rel, hash)
+            })
+            .collect(),
+    };
+
+    // Now make an unrelated, uncommitted change to the config: this is what
+    // must be reported, once gates 1 and 2b have let the symlinked ancestor
+    // through untroubled.
+    std::fs::write(
+        root.join(config::CONFIG_PATH),
+        "scope: [\"**\"]\nversion: 2\n",
+    )
+    .unwrap();
+
+    let state_dir = outer.path().join("state");
+    let mut o = pipeline::Options {
+        root: root.clone(),
+        state_dir,
+        cfg,
+        baseline: base,
+    };
+    let (r, _) = pipeline::eval(&mut o, None).expect("eval must not be a harness error");
+    assert_eq!(r.reason, verdict::Reason::ConfigChanged, "{}", r.message);
 }
 
 #[test]

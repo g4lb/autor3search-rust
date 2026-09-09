@@ -143,7 +143,16 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, FreezeError> {
 /// reached through a symlinked ancestor (macOS's `/tmp`, a home directory on a
 /// linked volume) is not tampering, and refusing to work there would break
 /// ordinary setups.
-fn symlink_component(root: &Path, rel: &str) -> Result<Option<String>, FreezeError> {
+///
+/// `pub(crate)` rather than private: [`crate::pipeline`]'s scope/locked-file
+/// gate reuses this exact check on every changed path before matching it
+/// against [`crate::scope::locked_file`] or the scope [`crate::scope::Matcher`]
+/// — a symlinked path (or one reached through a symlinked ancestor) can make
+/// `git status` report a single innocuous-looking entry (e.g. `.cargo`) that
+/// actually resolves, at build time, to a locked file such as
+/// `.cargo/config.toml`. One implementation means one place to get the
+/// "root itself is exempt" exception right.
+pub(crate) fn symlink_component(root: &Path, rel: &str) -> Result<Option<String>, FreezeError> {
     let mut path = root.to_path_buf();
     let mut seen: Vec<String> = Vec::new();
     for part in Path::new(rel).components() {
@@ -1090,6 +1099,34 @@ mod tests {
             restore(&f.repo, &f.store, &m),
             Err(FreezeError::Symlink(_))
         ));
+    }
+
+    // The deliberate exception `symlink_component` documents: `root` itself
+    // is never examined, only components beneath it, so a repository
+    // legitimately reached through a symlinked ancestor (macOS's `/tmp`, a
+    // home directory on a linked volume) is not tampering. No existing test
+    // exercised this directly before now — every other fixture here builds
+    // its repo under a plain `tempfile::tempdir()` path, and the ordinary
+    // symlink tests above only ever place the link BENEATH the repo root.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ancestor_of_root_itself_is_not_tampering() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        fs::create_dir_all(real.join("tests")).unwrap();
+        fs::write(real.join("tests/it.rs"), b"assert_eq!(1, 1);\n").unwrap();
+        let link = outer.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // `repo_root` is reached only through `link`, deliberately not
+        // canonicalized away.
+        let repo_root = link.clone();
+        let store = outer.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+
+        assert_eq!(symlink_component(&repo_root, "tests/it.rs").unwrap(), None);
+        let m = snapshot(&repo_root, &store, &files()).unwrap();
+        assert!(restore(&repo_root, &store, &m).unwrap().is_empty());
+        assert!(verify(&repo_root, &m).unwrap().is_empty());
     }
 
     #[cfg(unix)]
