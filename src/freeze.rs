@@ -9,7 +9,7 @@
 use quote::ToTokens;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 /// The frozen store, relative to the state directory.
@@ -289,10 +289,58 @@ pub fn verify(repo_root: &Path, m: &Manifest) -> Result<Vec<String>, FreezeError
 /// Doc comments are hashed as text, because a doctest's content *is* its
 /// text.
 pub fn inline_hashes(source: &str) -> Result<InlineHashes, String> {
-    let file = syn::parse_file(source).map_err(|e| format!("parse source: {e}"))?;
+    inline_hashes_in(source, None).map_err(|e| e.to_string())
+}
+
+/// Same as [`inline_hashes`], but resolves a `#[cfg(test)] mod x;` (or any
+/// further module declared without a body once inside one) against the
+/// filesystem, relative to `repo_root` — `rel` is the repo-relative path of
+/// the source file itself, matching a [`Manifest::inline`] key.
+///
+/// This is the real entry point: every caller that has a repository to read
+/// from (`baseline` and `verify_inline`) must use this, not [`inline_hashes`],
+/// or an out-of-line test module such as
+///
+/// ```text
+/// // src/lib.rs
+/// #[cfg(test)]
+/// mod tests;      // Item::Mod with content == None
+/// // src/tests.rs — the assertions themselves
+/// ```
+///
+/// hashes to the same empty-string digest whether the assertions inside
+/// `src/tests.rs` are real or gutted, because nothing in `src/lib.rs`'s own
+/// token text changes either way.
+pub fn inline_hashes_at(repo_root: &Path, rel: &str) -> Result<InlineHashes, FreezeError> {
+    no_symlink(repo_root, rel, "hash inline tests")?;
+    let path = safe_join(repo_root, rel)?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| FreezeError::Io(format!("read {rel}: {e}")))?;
+    inline_hashes_in(&text, Some((repo_root, rel)))
+}
+
+fn inline_hashes_in(source: &str, fs: Option<(&Path, &str)>) -> Result<InlineHashes, FreezeError> {
+    let file =
+        syn::parse_file(source).map_err(|e| FreezeError::Io(format!("parse source: {e}")))?;
 
     let mut cfg_test_digests = Vec::new();
-    collect_cfg_test(&file.items, &mut cfg_test_digests);
+    let mut seen = HashSet::new();
+    match fs {
+        Some((repo_root, rel)) => {
+            seen.insert(rel.to_string());
+            let loc = ModuleLoc::root(rel);
+            collect_cfg_test(
+                Some((repo_root, &loc)),
+                &file.items,
+                &mut cfg_test_digests,
+                &mut seen,
+                0,
+            )?;
+        }
+        None => {
+            collect_cfg_test(None, &file.items, &mut cfg_test_digests, &mut seen, 0)?;
+        }
+    }
     cfg_test_digests.sort();
 
     let mut docs = String::new();
@@ -303,6 +351,279 @@ pub fn inline_hashes(source: &str) -> Result<InlineHashes, String> {
         cfg_test: sha256_bytes(cfg_test_digests.concat().as_bytes()),
         doc: sha256_bytes(docs.as_bytes()),
     })
+}
+
+/// The directory containing a repo-relative, forward-slash path, `""` for
+/// one with no `/` in it (the repository root).
+fn dir_of(rel: &str) -> String {
+    match rel.rfind('/') {
+        Some(i) => rel[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// The final path segment of a repo-relative, forward-slash path.
+fn basename(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// `name` appended onto `base`, treating `""` as the repository root so the
+/// join never produces a leading slash.
+fn join_nonempty(base: &str, name: &str) -> String {
+    if base.is_empty() {
+        name.to_string()
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+/// Joins a `#[path = "..."]` attribute's value onto `base` (both
+/// repo-relative, forward-slash, `""` meaning the repository root),
+/// resolving any `.`/`..` components lexically and refusing to climb above
+/// the root.
+///
+/// The value comes from source the agent controls, so it is untrusted input
+/// in exactly the sense [`safe_join`]'s doc comment describes — this is that
+/// same defense, applied before a path ever reaches `safe_join`.
+fn join_rel(base: &str, part: &str) -> Result<String, FreezeError> {
+    if part.contains('\\') || part.contains(':') {
+        return Err(FreezeError::Io(format!(
+            "#[path] value {part:?} must use forward slashes and no drive prefix"
+        )));
+    }
+    if Path::new(part).is_absolute() {
+        return Err(FreezeError::Io(format!(
+            "#[path] value {part:?} must be relative"
+        )));
+    }
+    let mut stack: Vec<&str> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/').collect()
+    };
+    for comp in part.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() {
+                    return Err(FreezeError::Io(format!(
+                        "#[path] value {part:?} escapes the repository root"
+                    )));
+                }
+            }
+            seg => stack.push(seg),
+        }
+    }
+    Ok(stack.join("/"))
+}
+
+/// Where a file's module declarations resolve, mirroring rustc's own module
+/// file conventions closely enough for the harness's purposes: the crate
+/// root and any file literally named `mod.rs` contribute children directly
+/// into their own directory; every other file's children live in a
+/// subdirectory named after the module.
+///
+/// This is deliberately a heuristic based on the file's own name and path,
+/// not on tracing how it was actually reached from the crate root (this
+/// module hashes every in-scope source file independently — see
+/// [`crate::discover::in_scope_sources`] — so the real declaration chain is
+/// not available). It matches the standard convention every real crate that
+/// is not deliberately obscure follows.
+struct ModuleLoc {
+    /// Directory a `#[path = "..."]` attribute is resolved against: the
+    /// actual file's own directory, never the module-name subdirectory.
+    file_dir: String,
+    /// Directory an ordinary (no `#[path]`) child's `<name>.rs` or
+    /// `<name>/mod.rs` is looked up in.
+    children_dir: String,
+}
+
+impl ModuleLoc {
+    /// The location for the in-scope source file itself: every crate root
+    /// (`lib.rs`, `main.rs`) and every file scanned on its own is treated as
+    /// contributing children into its own directory, matching how rustc
+    /// treats the crate root — the only case this module needs to get right
+    /// on its own, since a file reached via an ordinary `mod name;`
+    /// (non-root, non-`mod.rs`) is instead given its location by
+    /// [`ModuleLoc::for_file`] when it is resolved.
+    fn root(rel: &str) -> ModuleLoc {
+        let dir = dir_of(rel);
+        ModuleLoc {
+            file_dir: dir.clone(),
+            children_dir: dir,
+        }
+    }
+
+    /// The location for a file just resolved as the target of `mod name;`
+    /// (with or without `#[path]`), given the repo-relative path it was
+    /// found at and the identifier it was declared under.
+    fn for_file(resolved_rel: &str, name: &str) -> ModuleLoc {
+        let file_dir = dir_of(resolved_rel);
+        let is_dir_owner = basename(resolved_rel) == "mod.rs";
+        let children_dir = if is_dir_owner {
+            file_dir.clone()
+        } else {
+            join_nonempty(&file_dir, name)
+        };
+        ModuleLoc {
+            file_dir,
+            children_dir,
+        }
+    }
+
+    /// The location for an INLINE module (`mod x { ... }`, same file), which
+    /// can itself carry `#[path]` to redirect where *its* children look.
+    fn for_inline(&self, name: &str, path_attr: Option<&str>) -> Result<ModuleLoc, FreezeError> {
+        let children_dir = match path_attr {
+            Some(p) => join_rel(&self.file_dir, p)?,
+            None => join_nonempty(&self.children_dir, name),
+        };
+        Ok(ModuleLoc {
+            file_dir: self.file_dir.clone(),
+            children_dir,
+        })
+    }
+}
+
+/// The maximum module-declaration nesting this will chase before refusing to
+/// go further. Generous for any real crate; exists so a cyclic or
+/// pathological chain of declarations fails loudly with a bounded amount of
+/// work instead of recursing forever.
+const MAX_MOD_DEPTH: usize = 64;
+
+/// Resolves a `mod name;` declaration (no inline body) to the repo-relative
+/// path of the file it names, honouring `#[path = "..."]` when present, and
+/// refusing a symlink anywhere along the way exactly as every other frozen
+/// path does.
+///
+/// Fails closed: a module the harness cannot resolve is exactly as dangerous
+/// as one whose content changed, so "the file is missing" or "the path
+/// attribute cannot be understood" is an error here, never treated as "no
+/// tests to hash" — see the module doc comment on why absence must never
+/// look identical to presence.
+fn resolve_mod_file(
+    repo_root: &Path,
+    loc: &ModuleLoc,
+    name: &str,
+    path_attr: Option<&str>,
+) -> Result<String, FreezeError> {
+    let candidates: Vec<String> = match path_attr {
+        Some(p) => vec![join_rel(&loc.file_dir, p)?],
+        None => {
+            let dir = join_nonempty(&loc.children_dir, name);
+            vec![
+                join_nonempty(&loc.children_dir, &format!("{name}.rs")),
+                format!("{dir}/mod.rs"),
+            ]
+        }
+    };
+    for cand in &candidates {
+        no_symlink(repo_root, cand, "resolve module")?;
+        let abs = safe_join(repo_root, cand)?;
+        if std::fs::metadata(&abs)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Ok(cand.clone());
+        }
+    }
+    Err(FreezeError::Io(format!(
+        "module {name:?} is declared without a body (`mod {name};`) but its file could not be \
+         found — looked for {}",
+        candidates.join(" or "),
+    )))
+}
+
+/// Hashes an out-of-line module file's entire token stream, plus — since
+/// everything inside it is already within a test-gated island regardless of
+/// its own attributes — every further module IT declares without a body,
+/// recursively. A symlink, an unreadable or unparseable file, and unbounded
+/// or cyclic nesting are all refused rather than silently skipped.
+fn hash_module_file(
+    repo_root: &Path,
+    rel: &str,
+    loc: &ModuleLoc,
+    depth: usize,
+    seen: &mut HashSet<String>,
+) -> Result<String, FreezeError> {
+    if depth > MAX_MOD_DEPTH {
+        return Err(FreezeError::Io(format!(
+            "module nesting is more than {MAX_MOD_DEPTH} deep resolving {rel:?} — refusing to \
+             recurse further"
+        )));
+    }
+    if !seen.insert(rel.to_string()) {
+        return Err(FreezeError::Io(format!(
+            "cyclic module declaration involving {rel:?}"
+        )));
+    }
+    no_symlink(repo_root, rel, "hash module")?;
+    let path = safe_join(repo_root, rel)?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| FreezeError::Io(format!("read {rel}: {e}")))?;
+    let file = syn::parse_file(&text).map_err(|e| FreezeError::Io(format!("parse {rel}: {e}")))?;
+
+    let mut parts = vec![file.to_token_stream().to_string()];
+    collect_declared_mods(&file.items, repo_root, loc, depth, seen, &mut parts)?;
+    Ok(sha256_bytes(parts.concat().as_bytes()))
+}
+
+/// Inside an already test-gated island: walks every item looking for a
+/// further module declared without a body — its own `#[cfg(test)]` no
+/// longer matters, since it inherits the gate from its parent — and appends
+/// each one's recursive hash. Also descends into INLINE modules to find such
+/// declarations nested inside them.
+fn collect_declared_mods(
+    items: &[syn::Item],
+    repo_root: &Path,
+    loc: &ModuleLoc,
+    depth: usize,
+    seen: &mut HashSet<String>,
+    parts: &mut Vec<String>,
+) -> Result<(), FreezeError> {
+    for item in items {
+        let syn::Item::Mod(m) = item else { continue };
+        match &m.content {
+            Some((_, inner)) => {
+                let path_attr = extract_path_attr(&m.attrs);
+                let child_loc = loc.for_inline(&m.ident.to_string(), path_attr.as_deref())?;
+                collect_declared_mods(inner, repo_root, &child_loc, depth, seen, parts)?;
+            }
+            None => {
+                let name = m.ident.to_string();
+                let path_attr = extract_path_attr(&m.attrs);
+                let child_rel = resolve_mod_file(repo_root, loc, &name, path_attr.as_deref())?;
+                let child_loc = ModuleLoc::for_file(&child_rel, &name);
+                parts.push(hash_module_file(
+                    repo_root,
+                    &child_rel,
+                    &child_loc,
+                    depth + 1,
+                    seen,
+                )?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The string value of a `#[path = "..."]` attribute, if present.
+fn extract_path_attr(attrs: &[syn::Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("path") {
+            continue;
+        }
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            {
+                return Some(s.value());
+            }
+        }
+    }
+    None
 }
 
 /// Whether an attribute is `#[cfg(...)]` with `test` mentioned in a position
@@ -389,57 +710,181 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
 /// Hashing per item rather than concatenating raw token text, and letting the
 /// caller sort the result, is what makes two sibling test items changing
 /// places in the file a no-op: nothing here depends on which one came first.
-fn collect_cfg_test(items: &[syn::Item], out: &mut Vec<String>) {
+///
+/// `fs` is `Some((repo_root, loc))` when there is a real file to resolve a
+/// `mod x;` declared without a body against — see [`inline_hashes_at`] — and
+/// `None` for the pure-string [`inline_hashes`], which cannot resolve one and
+/// fails closed instead of silently treating it as having no tests.
+fn collect_cfg_test(
+    fs: Option<(&Path, &ModuleLoc)>,
+    items: &[syn::Item],
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), FreezeError> {
     for item in items {
         if item_attrs(item).iter().any(is_cfg_test) {
+            if let syn::Item::Mod(m) = item {
+                if m.content.is_none() {
+                    let Some((repo_root, loc)) = fs else {
+                        return Err(FreezeError::Io(format!(
+                            "module {:?} is declared without a body (`mod {};`) and cannot be \
+                             resolved without a file path — this source must be hashed via \
+                             inline_hashes_at, not inline_hashes",
+                            m.ident, m.ident
+                        )));
+                    };
+                    let name = m.ident.to_string();
+                    let path_attr = extract_path_attr(&m.attrs);
+                    let child_rel = resolve_mod_file(repo_root, loc, &name, path_attr.as_deref())?;
+                    let child_loc = ModuleLoc::for_file(&child_rel, &name);
+                    out.push(hash_module_file(
+                        repo_root,
+                        &child_rel,
+                        &child_loc,
+                        depth + 1,
+                        seen,
+                    )?);
+                    continue;
+                }
+            }
             out.push(sha256_bytes(item.to_token_stream().to_string().as_bytes()));
             continue;
         }
         if let syn::Item::Mod(m) = item {
             if let Some((_, inner)) = &m.content {
-                collect_cfg_test(inner, out);
+                let child_fs = match fs {
+                    Some((repo_root, loc)) => {
+                        let path_attr = extract_path_attr(&m.attrs);
+                        let child_loc =
+                            loc.for_inline(&m.ident.to_string(), path_attr.as_deref())?;
+                        Some((repo_root, child_loc))
+                    }
+                    None => None,
+                };
+                collect_cfg_test(
+                    child_fs.as_ref().map(|(r, l)| (*r, l)),
+                    inner,
+                    out,
+                    seen,
+                    depth + 1,
+                )?;
             }
         }
     }
+    Ok(())
 }
 
 /// Appends every doc-comment line's text.
+///
+/// A `#[doc = include_str!("...")]` attribute is the one case whose actual
+/// doctest content lives in a file this cannot see (resolving it would need
+/// the containing file's own path, which most callers of this function do
+/// not have): at minimum, the macro's own token text — which contains the
+/// included path — is hashed, so a changed path is still detected even
+/// though the included file's content is not.
 fn collect_docs(attrs: &[syn::Attribute], out: &mut String) {
     for attr in attrs {
         if !attr.path().is_ident("doc") {
             continue;
         }
-        if let syn::Meta::NameValue(nv) = &attr.meta {
-            if let syn::Expr::Lit(syn::ExprLit {
+        let syn::Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        match &nv.value {
+            syn::Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Str(s),
                 ..
-            }) = &nv.value
-            {
+            }) => {
                 out.push_str(&s.value());
                 out.push('\n');
             }
+            syn::Expr::Macro(syn::ExprMacro { mac, .. }) => {
+                out.push_str(&mac.to_token_stream().to_string());
+                out.push('\n');
+            }
+            _ => {}
         }
     }
 }
 
-/// Walks every item that can carry a doc comment, recursing into modules and
-/// impl blocks.
+/// Every doc comment on the fields of a struct, tuple struct, enum variant,
+/// or union.
+fn collect_field_docs(fields: &syn::Fields, out: &mut String) {
+    match fields {
+        syn::Fields::Named(f) => {
+            for field in &f.named {
+                collect_docs(&field.attrs, out);
+            }
+        }
+        syn::Fields::Unnamed(f) => {
+            for field in &f.unnamed {
+                collect_docs(&field.attrs, out);
+            }
+        }
+        syn::Fields::Unit => {}
+    }
+}
+
+/// Walks every item that can carry a doc comment, recursing into modules,
+/// impl blocks, traits, `extern` blocks, and the fields of a struct, enum or
+/// union.
 fn collect_item_docs(items: &[syn::Item], out: &mut String) {
     for item in items {
         match item {
             syn::Item::Fn(i) => collect_docs(&i.attrs, out),
-            syn::Item::Struct(i) => collect_docs(&i.attrs, out),
-            syn::Item::Enum(i) => collect_docs(&i.attrs, out),
-            syn::Item::Trait(i) => collect_docs(&i.attrs, out),
+            syn::Item::Struct(i) => {
+                collect_docs(&i.attrs, out);
+                collect_field_docs(&i.fields, out);
+            }
+            syn::Item::Enum(i) => {
+                collect_docs(&i.attrs, out);
+                for v in &i.variants {
+                    collect_docs(&v.attrs, out);
+                    collect_field_docs(&v.fields, out);
+                }
+            }
+            syn::Item::Union(i) => {
+                collect_docs(&i.attrs, out);
+                for f in &i.fields.named {
+                    collect_docs(&f.attrs, out);
+                }
+            }
+            syn::Item::Trait(i) => {
+                collect_docs(&i.attrs, out);
+                for it in &i.items {
+                    match it {
+                        syn::TraitItem::Fn(f) => collect_docs(&f.attrs, out),
+                        syn::TraitItem::Const(c) => collect_docs(&c.attrs, out),
+                        syn::TraitItem::Type(t) => collect_docs(&t.attrs, out),
+                        _ => {}
+                    }
+                }
+            }
             syn::Item::Const(i) => collect_docs(&i.attrs, out),
             syn::Item::Static(i) => collect_docs(&i.attrs, out),
             syn::Item::Type(i) => collect_docs(&i.attrs, out),
             syn::Item::Macro(i) => collect_docs(&i.attrs, out),
+            syn::Item::ForeignMod(i) => {
+                collect_docs(&i.attrs, out);
+                for it in &i.items {
+                    match it {
+                        syn::ForeignItem::Fn(f) => collect_docs(&f.attrs, out),
+                        syn::ForeignItem::Static(s) => collect_docs(&s.attrs, out),
+                        syn::ForeignItem::Type(t) => collect_docs(&t.attrs, out),
+                        syn::ForeignItem::Macro(m) => collect_docs(&m.attrs, out),
+                        _ => {}
+                    }
+                }
+            }
             syn::Item::Impl(i) => {
                 collect_docs(&i.attrs, out);
                 for it in &i.items {
-                    if let syn::ImplItem::Fn(f) = it {
-                        collect_docs(&f.attrs, out);
+                    match it {
+                        syn::ImplItem::Fn(f) => collect_docs(&f.attrs, out),
+                        syn::ImplItem::Const(c) => collect_docs(&c.attrs, out),
+                        syn::ImplItem::Type(t) => collect_docs(&t.attrs, out),
+                        _ => {}
                     }
                 }
             }
@@ -461,19 +906,14 @@ fn collect_item_docs(items: &[syn::Item], out: &mut String) {
 pub fn verify_inline(repo_root: &Path, m: &Manifest) -> Result<Vec<String>, FreezeError> {
     let mut changed = Vec::new();
     for (rel, want) in &m.inline {
-        if symlink_component(repo_root, rel)?.is_some() {
-            changed.push(rel.clone());
-            continue;
-        }
-        let path = safe_join(repo_root, rel)?;
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            changed.push(rel.clone());
-            continue;
-        };
-        match inline_hashes(&text) {
+        match inline_hashes_at(repo_root, rel) {
             Ok(got) if &got == want => {}
-            // A file that stopped parsing has certainly changed, and the build
-            // gate will report the syntax error properly a moment later.
+            // Anything else — a deleted or symlinked file, one that no
+            // longer parses (an unparseable file is a syntax error the build
+            // gate, which runs after this one, will report properly; here it
+            // simply cannot be hashed), or a `mod x;` declaration whose file
+            // can no longer be resolved — counts as changed. Absence must
+            // never look identical to presence.
             _ => changed.push(rel.clone()),
         }
     }
@@ -915,5 +1355,232 @@ mod tests_a {
             inline_hashes(ORIGINAL).unwrap().cfg_test,
             inline_hashes(&content_changed).unwrap().cfg_test
         );
+    }
+
+    // C1: `#[cfg(test)] mod tests;` declared without a body — the idiomatic
+    // large-crate layout, where the assertions live in their own file that
+    // carries no `#[cfg(test)]` of its own. Before this fix, `inline_hashes`
+    // only ever saw `src/lib.rs`'s own token text, which is the literal three
+    // tokens `mod tests ;` whether the assertions in `src/tests.rs` are real
+    // or gutted — so the digest could not tell the two apart.
+    #[test]
+    fn an_out_of_line_cfg_test_module_is_hashed_via_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/tests.rs"),
+            "use super::*;\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .unwrap();
+
+        let baseline = inline_hashes_at(root, "src/lib.rs").unwrap();
+
+        // Weakening the assertion in the SEPARATE file — no edit to lib.rs
+        // at all — must change the digest.
+        fs::write(
+            root.join("src/tests.rs"),
+            "use super::*;\n#[test]\nfn adds() { assert!(true); }\n",
+        )
+        .unwrap();
+        let weakened = inline_hashes_at(root, "src/lib.rs").unwrap();
+        assert_ne!(baseline.cfg_test, weakened.cfg_test);
+
+        // Restore the real assertion, then prove moving UNRELATED
+        // implementation code around in lib.rs does not trip the gate: the
+        // agent is entitled to edit that file.
+        fs::write(
+            root.join("src/tests.rs"),
+            "use super::*;\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(test)]\nmod tests;\n\npub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        )
+        .unwrap();
+        let moved = inline_hashes_at(root, "src/lib.rs").unwrap();
+        assert_eq!(baseline.cfg_test, moved.cfg_test);
+    }
+
+    // C1: a `#[path = "..."]` attribute must be honoured, not just the
+    // `<name>.rs` / `<name>/mod.rs` convention.
+    #[test]
+    fn a_path_attribute_redirects_module_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/test_support")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(test)]\n#[path = \"test_support/checks.rs\"]\nmod tests;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/test_support/checks.rs"),
+            "#[test]\nfn t() { assert_eq!(1 + 1, 2); }\n",
+        )
+        .unwrap();
+
+        let baseline = inline_hashes_at(root, "src/lib.rs").unwrap();
+        fs::write(
+            root.join("src/test_support/checks.rs"),
+            "#[test]\nfn t() { assert!(true); }\n",
+        )
+        .unwrap();
+        let weakened = inline_hashes_at(root, "src/lib.rs").unwrap();
+        assert_ne!(baseline.cfg_test, weakened.cfg_test);
+    }
+
+    // C1: a declared submodule can itself declare another. Once inside a
+    // test-gated island, the nested declaration needs no `#[cfg(test)]` of
+    // its own to count — it inherits the gate from its parent.
+    #[test]
+    fn a_nested_out_of_line_declaration_inside_a_test_module_is_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/tests")).unwrap();
+        fs::write(root.join("src/lib.rs"), "#[cfg(test)]\nmod tests;\n").unwrap();
+        fs::write(root.join("src/tests.rs"), "mod helpers;\n").unwrap();
+        fs::write(
+            root.join("src/tests/helpers.rs"),
+            "#[test]\nfn h() { assert_eq!(2 + 2, 4); }\n",
+        )
+        .unwrap();
+
+        let baseline = inline_hashes_at(root, "src/lib.rs").unwrap();
+        fs::write(
+            root.join("src/tests/helpers.rs"),
+            "#[test]\nfn h() { assert!(true); }\n",
+        )
+        .unwrap();
+        let weakened = inline_hashes_at(root, "src/lib.rs").unwrap();
+        assert_ne!(baseline.cfg_test, weakened.cfg_test);
+    }
+
+    // C1: absence must never look identical to presence. A declared module
+    // whose file cannot be found is a hard error, not "no tests here".
+    #[test]
+    fn a_missing_out_of_line_module_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "#[cfg(test)]\nmod tests;\n").unwrap();
+        // src/tests.rs deliberately not created.
+        assert!(inline_hashes_at(root, "src/lib.rs").is_err());
+    }
+
+    // C1, via the real call `pipeline::eval` gate 5 uses: `verify_inline`
+    // must fail closed the same way `inline_hashes_at` does, for a manifest
+    // entry whose declared module file has disappeared since baseline.
+    #[test]
+    fn verify_inline_fails_closed_when_a_declared_module_file_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "#[cfg(test)]\nmod tests;\n").unwrap();
+        fs::write(
+            root.join("src/tests.rs"),
+            "#[test]\nfn t() { assert_eq!(1, 1); }\n",
+        )
+        .unwrap();
+
+        let mut m = Manifest::default();
+        m.inline.insert(
+            "src/lib.rs".into(),
+            inline_hashes_at(root, "src/lib.rs").unwrap(),
+        );
+
+        fs::remove_file(root.join("src/tests.rs")).unwrap();
+        assert_eq!(verify_inline(root, &m).unwrap(), vec!["src/lib.rs"]);
+    }
+
+    // I8: a doctest in an item position the walker used to miss entirely —
+    // a trait method, a struct field, an enum variant, an associated const
+    // inside an `impl`, an `extern` block, and a `union` — must be hashed
+    // just as a doctest on a free function is.
+    #[test]
+    fn doctests_in_previously_missed_item_positions_are_hashed() {
+        const SRC: &str = r#"
+trait Greet {
+    /// ```
+    /// assert_eq!(1, 1);
+    /// ```
+    fn greet(&self);
+}
+
+struct S {
+    /// ```
+    /// assert_eq!(2, 2);
+    /// ```
+    field: i32,
+}
+
+enum E {
+    /// ```
+    /// assert_eq!(3, 3);
+    /// ```
+    Variant,
+}
+
+union U {
+    /// ```
+    /// assert_eq!(4, 4);
+    /// ```
+    field: i32,
+}
+
+struct T;
+impl T {
+    /// ```
+    /// assert_eq!(5, 5);
+    /// ```
+    const N: i32 = 1;
+}
+
+extern "C" {
+    /// ```
+    /// assert_eq!(6, 6);
+    /// ```
+    fn f();
+}
+"#;
+        let base = inline_hashes(SRC).unwrap().doc;
+        for (needle, replacement) in [
+            ("assert_eq!(1, 1);", "assert!(true);"),
+            ("assert_eq!(2, 2);", "assert!(true);"),
+            ("assert_eq!(3, 3);", "assert!(true);"),
+            ("assert_eq!(4, 4);", "assert!(true);"),
+            ("assert_eq!(5, 5);", "assert!(true);"),
+            ("assert_eq!(6, 6);", "assert!(true);"),
+        ] {
+            let weakened = SRC.replace(needle, replacement);
+            assert_ne!(
+                base,
+                inline_hashes(&weakened).unwrap().doc,
+                "weakening the doctest touching {needle:?} must change the doc hash"
+            );
+        }
+    }
+
+    // I8: `#[doc = include_str!("...")]` is an `Expr::Macro`, which the old
+    // walker skipped outright, taking the included file's doctest content
+    // with it into the empty-string digest. At minimum, a changed included
+    // path must be detected — the macro's own token text is hashed.
+    #[test]
+    fn doc_include_str_path_changes_are_detected() {
+        const A: &str = r#"
+#[doc = include_str!("../doc/a.md")]
+pub fn f() {}
+"#;
+        const B: &str = r#"
+#[doc = include_str!("../doc/b.md")]
+pub fn f() {}
+"#;
+        assert_ne!(inline_hashes(A).unwrap().doc, inline_hashes(B).unwrap().doc);
     }
 }
