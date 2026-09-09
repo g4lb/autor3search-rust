@@ -566,11 +566,15 @@ None of these is cosmetic, and none of them is going to change soon.
   builds `--release`, because that is what the benchmarks run as. Gate 8 then
   runs `cargo test`, which builds the same graph again in `debug` — deliberately,
   so `debug_assert!` and arithmetic-overflow checks stay armed, but at real
-  cost: measured at 7.5 s on the bundled demo crate, whose entire dependency
-  graph is criterion and its transitives. On a heavier crate this dominates an
-  experiment's wall time more than the benchmark rounds do. The Go original's
-  reasoning that per-round measurement overhead dominates does not carry over
-  here, and this is the reason.
+  cost — but a **cold** one, paid once. Neither `baseline` nor `eval` ever
+  cleans the target directory, so only the first eval of a run pays for the
+  debug profile from scratch: measured at 8.1 s cold on the bundled demo
+  crate, against 1.2 s warm. In steady state — every eval after the first,
+  which is essentially all of an overnight run — the two compiles together
+  cost about 4 s while the benchmark rounds cost 70 s or more by design, so
+  measurement time dominates by better than an order of magnitude. The double
+  compile only becomes the larger cost on a crate whose dependency graph is
+  unusually large *and* where every experiment invalidates the debug profile.
 
 - **No allocation metrics at all.** Go gets `B/op` and `allocs/op` free from
   `-benchmem`. Criterion measures time only, and counting allocations would
