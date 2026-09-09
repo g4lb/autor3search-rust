@@ -169,8 +169,9 @@ fn force_signal(dir: &Path) -> String {
 /// Polls [`state::eval_running`] rather than the pid directly: a signalled
 /// process that has died but not yet been reaped by its parent is a
 /// ZOMBIE, and a liveness probe against the bare pid can still say yes for
-/// one. `eval_running`'s claim is a kernel `flock` released the moment the
-/// process exits by any means, zombie or not, so it is the honest signal.
+/// one. `eval_running`'s claim (a kernel `flock` on unix, an exclusive
+/// file-sharing handle on Windows) is released the moment the process
+/// exits by any means, zombie or not, so it is the honest signal.
 fn wait_for_release(dir: &Path, grace: Duration) -> bool {
     let deadline = std::time::Instant::now() + grace;
     loop {
