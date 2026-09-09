@@ -3,6 +3,56 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+/// A cargo target directory shared by every fixture that does NOT itself
+/// compare a baseline build against a candidate build.
+///
+/// The dominant cost in this test suite was never the harness — it was
+/// `init`'s `cargo bench -- --list`, which compiles criterion and its ~30
+/// transitive dependencies from scratch, in a fresh `TestRepo` tempdir, on
+/// every single test. Pointing that build at one directory shared across the
+/// whole `cargo test` invocation lets the first test pay for criterion once
+/// and every later test reuse the compiled `.rlib`s; only the tiny fixture
+/// crate itself (still keyed by its own tempdir path) needs a fast local
+/// recompile per test.
+///
+/// Deliberately a STABLE path under this crate's own `target/`, not a fresh
+/// `tempfile::tempdir()`: reused across separate `cargo test` invocations on
+/// a developer's machine, it keeps paying off after the first run of the
+/// day, not just within one. `cargo clean` sweeps it along with everything
+/// else under `target/`, and CI starts cold regardless since nothing under
+/// `target/` is checked in — a stale directory can make a rebuild
+/// unnecessary, never make an actual test assertion pass that should fail,
+/// because every fixture's own crate is still fingerprinted by its own
+/// (fresh, per-test) absolute tempdir path.
+#[allow(dead_code)]
+pub fn shared_target_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/it-shared")
+}
+
+/// The `CARGO_TARGET_DIR` `run_cli`/`spawn_cli` should set for `args`, or
+/// `None` to leave cargo's own default (one target dir per directory) alone.
+///
+/// `eval` is the one command that builds BOTH the pinned baseline worktree
+/// and the candidate tree and interleaves real criterion measurements
+/// between them (see `measure::run`). The design spec (§4, "Baseline
+/// worktree and build cache") is explicit that those two builds must never
+/// share a `CARGO_TARGET_DIR`: sharing one would serialize them on cargo's
+/// build lock and let one side's build artifacts influence the other,
+/// contaminating the very comparison the tool exists to produce. Every other
+/// command here either never invokes cargo, or only ever builds the one
+/// tree it was given (see `cmd_baseline`, `cmd_status`, `cmd_stop`,
+/// `cmd_report`, `cmd_profile`, `discover::cargo_metadata` — none of them
+/// touch a second worktree), so sharing a target directory for them is safe.
+/// Returning `None` for `eval` alone is what keeps this test-only speedup
+/// from ever reaching the one code path production's isolation guarantee
+/// actually protects.
+fn cargo_target_dir_for(args: &[&str]) -> Option<PathBuf> {
+    if args.first() == Some(&"eval") {
+        return None;
+    }
+    Some(shared_target_dir())
+}
+
 /// Runs the compiled binary against `repo`, pointed at its own out-of-tree
 /// state home so tests never touch the developer's real cache.
 ///
@@ -12,13 +62,15 @@ use std::process::{Child, Command, Output, Stdio};
 /// warning itself.
 #[allow(dead_code)]
 pub fn run_cli(repo: &TestRepo, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_autor3search-rust"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_autor3search-rust"));
+    cmd.args(args)
         .arg("-C")
         .arg(repo.path())
-        .env("AUTOR3SEARCH_RUST_STATE_HOME", repo.state_home())
-        .output()
-        .expect("run command")
+        .env("AUTOR3SEARCH_RUST_STATE_HOME", repo.state_home());
+    if let Some(dir) = cargo_target_dir_for(args) {
+        cmd.env("CARGO_TARGET_DIR", dir);
+    }
+    cmd.output().expect("run command")
 }
 
 /// Starts the compiled binary against `repo` WITHOUT waiting for it, for a
@@ -31,15 +83,17 @@ pub fn run_cli(repo: &TestRepo, args: &[&str]) -> Output {
 /// today, so it carries `#[allow(dead_code)]` like every other helper here.
 #[allow(dead_code)]
 pub fn spawn_cli(repo: &TestRepo, args: &[&str]) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_autor3search-rust"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_autor3search-rust"));
+    cmd.args(args)
         .arg("-C")
         .arg(repo.path())
         .env("AUTOR3SEARCH_RUST_STATE_HOME", repo.state_home())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn command")
+        .stderr(Stdio::piped());
+    if let Some(dir) = cargo_target_dir_for(args) {
+        cmd.env("CARGO_TARGET_DIR", dir);
+    }
+    cmd.spawn().expect("spawn command")
 }
 
 /// Runs a git command in `root`, panicking on failure. For test setup only.
@@ -232,8 +286,13 @@ fn copy_dir(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();
-        // Never copy build output or a lock file into the fixture.
-        if name == "target" || name == "Cargo.lock" {
+        // Never copy build output into the fixture. `Cargo.lock` IS copied —
+        // pinning identical dependency versions across every fixture is what
+        // makes them deterministic, and what lets the shared
+        // `CARGO_TARGET_DIR` above actually reuse compiled artifacts instead
+        // of re-resolving (and potentially re-picking different versions of)
+        // the dependency graph from the registry on every single test.
+        if name == "target" {
             continue;
         }
         let dst = to.join(&name);
