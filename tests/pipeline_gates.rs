@@ -117,6 +117,86 @@ fn an_edited_integration_test_is_restored_rather_than_rejected() {
     );
 }
 
+// C1: the idiomatic large-crate layout — `#[cfg(test)] mod tests;` in
+// lib.rs, with the actual assertions living in `src/tests.rs`, which carries
+// no `#[cfg(test)]` of its own — must be caught exactly like the inline form
+// is. Before the fix, gutting `src/tests.rs` changed nothing `lib.rs`'s own
+// digest could see.
+#[test]
+fn an_out_of_line_cfg_test_module_is_caught_when_gutted() {
+    let repo = TestRepo::demo();
+    common::run_cli(&repo, &["init"]);
+
+    let lib_path = repo.path().join("src/lib.rs");
+    let lib_text = std::fs::read_to_string(&lib_path).unwrap();
+    let split = lib_text
+        .split("#[cfg(test)]")
+        .next()
+        .expect("lib.rs must declare a #[cfg(test)] module")
+        .to_string()
+        + "#[cfg(test)]\nmod tests;\n";
+    std::fs::write(&lib_path, split).unwrap();
+    let real_test = "use super::*;\n\n#[test]\nfn counts_repeated_words() {\n    let got = \
+         count_words(\"the quick brown the\");\n    assert_eq!(got[\"the\"], 2);\n    \
+         assert_eq!(got[\"quick\"], 1);\n    assert_eq!(got[\"brown\"], 1);\n    \
+         assert_eq!(got.len(), 3);\n}\n";
+    std::fs::write(repo.path().join("src/tests.rs"), real_test).unwrap();
+
+    common::git(repo.path(), &["add", "-A"]);
+    common::git(
+        repo.path(),
+        &["commit", "-qm", "split the test module out of line"],
+    );
+    assert!(
+        common::run_cli(&repo, &["baseline", "--tag", "t1"])
+            .status
+            .success()
+    );
+    let root = repo.path().to_path_buf();
+    let dir = common::state_dir(&repo, "t1");
+    let cfg = config::Config::load(&root.join(config::CONFIG_PATH)).unwrap();
+    let base = state::Baseline::load(&dir.join(state::BASELINE_FILE)).unwrap();
+
+    // Gut the assertion in the separate file — lib.rs is untouched.
+    std::fs::write(
+        repo.path().join("src/tests.rs"),
+        "use super::*;\n\n#[test]\nfn counts_repeated_words() { assert!(true); }\n",
+    )
+    .unwrap();
+
+    let r = eval_now(&repo, cfg, base, &dir);
+    assert_eq!(r.status, verdict::Status::Fail);
+    assert_eq!(r.reason, verdict::Reason::InlineTestModified);
+    assert!(r.message.contains("src/lib.rs"), "{}", r.message);
+}
+
+// I2: `.gitignore` hiding `.cargo/` from git makes the git-diff-based
+// locked-file check blind to a `.cargo/config.toml` created afterward —
+// the direct-stat check must still catch it.
+#[test]
+fn a_gitignored_cargo_config_is_still_caught_by_the_direct_stat_check() {
+    let repo = TestRepo::demo();
+    let (mut cfg, base, dir) = ready(&repo);
+    cfg.scope = vec!["**".to_string()];
+
+    let gitignore = repo.path().join(".gitignore");
+    let mut text = std::fs::read_to_string(&gitignore).unwrap();
+    text.push_str("\n.cargo/\n");
+    std::fs::write(&gitignore, text).unwrap();
+
+    std::fs::create_dir_all(repo.path().join(".cargo")).unwrap();
+    std::fs::write(
+        repo.path().join(".cargo/config.toml"),
+        "[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
+    )
+    .unwrap();
+
+    let r = eval_now(&repo, cfg, base, &dir);
+    assert_eq!(r.status, verdict::Status::Fail);
+    assert_eq!(r.reason, verdict::Reason::ScopeViolation);
+    assert!(r.message.contains(".cargo/config.toml"), "{}", r.message);
+}
+
 // The Rust-specific half of the freeze gate.
 #[test]
 fn weakening_an_inline_test_fails_with_inline_test_modified() {

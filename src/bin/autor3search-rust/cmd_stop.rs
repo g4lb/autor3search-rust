@@ -125,6 +125,14 @@ fn force_signal(dir: &Path) -> String {
         Err(e) => return format!("could not tell whether an eval is running: {e}\n"),
     };
     let Some(pid) = live else {
+        // `eval_running` returning `None` can mean either that no pid file
+        // exists at all, or that one does but nobody holds its lock — a
+        // leftover from an `eval` that died without releasing its claim (a
+        // `SIGKILL`, a panic, a crash). Clear it here, as the Go original
+        // does, to keep the recorded state honest rather than leaving a
+        // known-stale pid file sitting on disk indefinitely. Clearing a
+        // file that is not there is not an error.
+        let _ = state::clear_eval_pid(dir);
         return "no eval running — nothing to signal\n".to_string();
     };
 

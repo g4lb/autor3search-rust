@@ -109,16 +109,24 @@ fn freeze_and_pin(
     let mut manifest = freeze::snapshot(root, &store, &frozen).map_err(|e| e.to_string())?;
 
     // Hash the tests that cannot be: inline #[cfg(test)] modules and doctests
-    // inside the source files the agent is allowed to edit.
+    // inside the source files the agent is allowed to edit. `inline_hashes_at`
+    // (not the pure-string `inline_hashes`) is what lets a `#[cfg(test)] mod
+    // tests;` declared without a body resolve to its own file.
     let matcher = scope::Matcher::new(&cfg.scope);
     for rel in discover::in_scope_sources(root, &matcher)? {
-        let text =
-            std::fs::read_to_string(root.join(&rel)).map_err(|e| format!("read {rel}: {e}"))?;
-        manifest
-            .inline
-            .insert(rel.clone(), freeze::inline_hashes(&text)?);
+        let hashes = freeze::inline_hashes_at(root, &rel).map_err(|e| e.to_string())?;
+        manifest.inline.insert(rel.clone(), hashes);
     }
     manifest.save(&dir.join(freeze::MANIFEST_PATH))?;
+
+    // Hash every locked file present on disk, independent of git: `eval`
+    // gate 2 stats these paths directly, which is what catches a locked file
+    // that a repo's own (or the agent's own) `.gitignore` hides from
+    // `git diff`/`git status`.
+    let mut locked_files = std::collections::BTreeMap::new();
+    for rel in discover::locked_files(root)? {
+        locked_files.insert(rel.clone(), freeze::sha256_file(&root.join(&rel))?);
+    }
 
     // Pin the measurement worktree.
     let worktree = dir.join(state::WORKTREE_NAME);
@@ -133,6 +141,7 @@ fn freeze_and_pin(
         benchmarks: cfg.benchmarks.clone(),
         bench_targets: cfg.bench_targets.clone(),
         config_sha256: freeze::sha256_file(cfg_path)?,
+        locked_files,
     };
     record.save(&dir.join(state::BASELINE_FILE))?;
 

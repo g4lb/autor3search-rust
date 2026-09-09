@@ -234,6 +234,56 @@ pub fn in_scope_sources(root: &Path, m: &Matcher) -> Result<Vec<String>, String>
     Ok(all)
 }
 
+/// Directories `locked_files` never walks into: build output and the VCS
+/// metadata directory. Deliberately narrower than [`skip_dir`]'s "any
+/// dot-prefixed directory" — a locked file can itself live under a
+/// dot-prefixed directory (`.cargo/config.toml`), so that rule would hide
+/// the very thing this function exists to find.
+fn skip_dir_for_locked(name: &str) -> bool {
+    name == "target" || name == ".git"
+}
+
+fn walk_locked(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    let dir = root.join(rel);
+    let entries =
+        std::fs::read_dir(&dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child = rel.join(&name);
+        let file_type = entry.file_type().map_err(|e| format!("stat {name}: {e}"))?;
+        if file_type.is_dir() {
+            if skip_dir_for_locked(&name) {
+                continue;
+            }
+            walk_locked(root, &child, out)?;
+        } else if file_type.is_file() {
+            let rel_str = child.to_string_lossy().replace('\\', "/");
+            if crate::scope::locked_file(&rel_str).is_some() {
+                out.push(rel_str);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every locked file (see [`crate::scope::locked_file`]) actually present on
+/// disk, at any depth, sorted — found by statting the filesystem directly
+/// rather than by trusting git's view of what changed.
+///
+/// `git diff`/`git status` both omit gitignored paths, so a repository that
+/// gitignores `Cargo.lock` (common) or `.cargo/` (an agent could add this to
+/// an in-scope `.gitignore` itself) makes the git-derived half of the locked-
+/// file gate blind to exactly the files it exists to protect. This walk is
+/// what lets the gate compare hashes of what is really on disk, independent
+/// of whatever git has been told to ignore.
+pub fn locked_files(root: &Path) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    walk_locked(root, Path::new(""), &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +570,33 @@ edition = "2021"
             !result,
             "missing manifest should be treated as not criterion"
         );
+    }
+
+    // I2: the direct-stat locked-file walk must find a `.cargo/config.toml`
+    // even though `.cargo` is a dot-prefixed directory that the `.rs`-file
+    // walk (`skip_dir`) always skips — a locked file can legitimately live
+    // under one, and this walk exists precisely to see it regardless of
+    // what git has been told to ignore.
+    #[test]
+    fn locked_files_finds_cargo_config_under_a_dot_directory() {
+        let r = repo();
+        fs::create_dir_all(r.root.join(".cargo")).unwrap();
+        fs::write(r.root.join(".cargo/config.toml"), "[build]\n").unwrap();
+        fs::write(r.root.join("Cargo.toml"), "[package]\n").unwrap();
+        let found = locked_files(&r.root).unwrap();
+        assert_eq!(found, vec![".cargo/config.toml", "Cargo.toml"]);
+    }
+
+    // target/ and .git/ hold build output and VCS internals respectively,
+    // never something worth hashing, and .git/ in particular can be huge.
+    #[test]
+    fn locked_files_skips_target_and_git() {
+        let r = repo();
+        fs::create_dir_all(r.root.join("target/debug")).unwrap();
+        fs::write(r.root.join("target/debug/Cargo.toml"), "decoy\n").unwrap();
+        fs::create_dir_all(r.root.join(".git/refs")).unwrap();
+        fs::write(r.root.join(".git/refs/Cargo.toml"), "decoy\n").unwrap();
+        assert!(locked_files(&r.root).unwrap().is_empty());
     }
 
     #[test]

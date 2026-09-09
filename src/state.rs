@@ -168,6 +168,16 @@ pub struct Baseline {
     /// the repository because humans own it, so it is protected by integrity
     /// checking rather than by relocation.
     pub config_sha256: String,
+    /// Every locked file (see [`crate::scope::locked_file`]) present at
+    /// baseline time, mapped to its hash — populated by statting the
+    /// filesystem directly (see [`crate::discover::locked_files`]), not by
+    /// asking git what changed, so a gitignored `Cargo.lock` or a `.cargo/`
+    /// an agent later adds to `.gitignore` cannot evade the check. `eval`
+    /// recomputes this same map and any addition, removal or hash change
+    /// is `FAIL(scope_violation)` — independent of, and in addition to, the
+    /// git-diff-based locked-file check.
+    #[serde(default)]
+    pub locked_files: std::collections::BTreeMap<String, String>,
 }
 
 impl Baseline {
@@ -554,6 +564,7 @@ mod tests {
                 target: "wordcount".into(),
             }],
             config_sha256: "0".repeat(64),
+            locked_files: std::collections::BTreeMap::new(),
         }
     }
 
