@@ -518,6 +518,17 @@ useless.
 
 None of these is cosmetic, and none of them is going to change soon.
 
+- **The symlink defenses are verified on unix only.** A locked file reached
+  through a symlink — a `.cargo` directory standing in for one elsewhere, say
+  — is refused at three independent layers, and there are tests for each. All
+  of those tests are `#[cfg(unix)]`. Windows reparse points and junctions are
+  handled by the same code paths and should behave the same way, but nobody
+  has run it on Windows hardware. Two narrower gaps are known and unclosed: a
+  check-then-build race within a single `eval`, and anything that makes
+  `cargo metadata` misreport a workspace member — the second only weakens one
+  of the three layers, since the generic filesystem walk does not consult
+  `cargo metadata` at all.
+
 - **An `eval` compiles the dependency graph twice, in two profiles.** Gate 7
   builds `--release`, because that is what the benchmarks run as. Gate 8 then
   runs `cargo test`, which builds the same graph again in `debug` — deliberately,
