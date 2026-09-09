@@ -274,15 +274,26 @@ const MAX_LOCKED_WALK_DEPTH: usize = 64;
 
 /// Recurses into `rel`, recording every locked file found.
 ///
-/// Uses `std::fs::metadata` rather than `DirEntry::file_type()` to decide
-/// whether an entry is a file or a directory: `file_type()` reports on the
-/// directory entry itself and, by contract, does NOT follow a symlink, so a
-/// symlinked `.cargo` would look like neither a file nor a directory and the
-/// walk would silently skip it — exactly the gap a symlinked locked file (or
-/// locked-file *directory*) exploits. `metadata` follows the link, so a
-/// symlinked `.cargo` is walked into like a real directory and a symlinked
-/// `config.toml` is recorded like a real file, matching what `cargo` itself
-/// sees when it reads these paths at build time.
+/// For an ordinary (non-symlink) entry, `DirEntry::file_type()` — filled in
+/// from the directory listing itself, with no extra syscall on the platforms
+/// this runs on — is trusted directly to decide file vs. directory: with no
+/// indirection involved, it reports exactly what `std::fs::metadata` would.
+/// Only a symlink entry is ambiguous: `file_type()` reports "symlink" and,
+/// by contract, does NOT say what the *target* is, so `metadata` (which
+/// follows the link) is called just for that one entry to resolve it — a
+/// symlinked `.cargo` is still walked into like a real directory and a
+/// symlinked `config.toml` is still recorded like a real file, matching what
+/// `cargo` itself sees when it reads these paths at build time. This is what
+/// let a symlinked `.cargo` slip past an earlier version of this walk that
+/// used `file_type()` alone and treated "symlink" as neither file nor
+/// directory: the fix is to fall back to `metadata` for a symlink, not to
+/// call it for every entry — which is what made this walk cost one stat
+/// syscall per file in the repository regardless of whether anything here
+/// could possibly be a locked file. The locked shapes this is actually
+/// looking for (`Cargo.toml`/`Cargo.lock` at any depth, `.cargo/config` at
+/// any depth) are a handful of fixed names; deciding directory-vs-file for
+/// the other, non-symlink entries is the only per-entry cost this needs to
+/// pay, and readdir already gives it that for free.
 ///
 /// Following links makes a cycle possible (a symlink pointing at an
 /// ancestor, or at another symlink that loops back), so `seen_dirs` records
@@ -317,19 +328,29 @@ fn walk_locked(
         let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let child = rel.join(&name);
-        let child_path = root.join(&child);
-        let meta = match std::fs::metadata(&child_path) {
-            Ok(m) => m,
-            // A dangling symlink, or something removed between the readdir
-            // and this stat: neither is a locked file to record.
-            Err(_) => continue,
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("file type {}: {e}", child.display()))?;
+
+        // Only a symlink needs the expensive, link-following stat: for
+        // anything else, file_type() already tells the truth.
+        let (is_dir, is_file) = if file_type.is_symlink() {
+            match std::fs::metadata(root.join(&child)) {
+                Ok(meta) => (meta.is_dir(), meta.is_file()),
+                // A dangling symlink, or something removed between the
+                // readdir and this stat: neither is a locked file to record.
+                Err(_) => continue,
+            }
+        } else {
+            (file_type.is_dir(), file_type.is_file())
         };
-        if meta.is_dir() {
+
+        if is_dir {
             if skip_dir_for_locked(&name) {
                 continue;
             }
             walk_locked(root, &child, out, seen_dirs, depth + 1)?;
-        } else if meta.is_file() {
+        } else if is_file {
             let rel_str = child.to_string_lossy().replace('\\', "/");
             if crate::scope::locked_file(&rel_str).is_some() {
                 out.push(rel_str);

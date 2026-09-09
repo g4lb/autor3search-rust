@@ -4,9 +4,22 @@ use std::process::Command;
 mod common;
 use common::TestRepo;
 
+// `init` runs a real `cargo bench -- --list` to discover benchmarks, which
+// is the single most expensive thing any of these commands do (it compiles
+// criterion and its transitive dependencies from scratch the first time).
+// Pointing it at the shared target dir every other fixture uses (see
+// `common::shared_target_dir`) lets that compile happen once for the whole
+// `cargo test` run rather than once per test in this file. `init` never
+// builds a second, baseline worktree, so — unlike `eval` — sharing it here
+// is safe; see `common::cargo_target_dir_for`'s doc comment for why that
+// distinction matters.
 fn init(repo: &Path, extra: &[&str]) -> std::process::Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_autor3search-rust"));
-    c.arg("init").arg("-C").arg(repo).args(extra);
+    c.arg("init")
+        .arg("-C")
+        .arg(repo)
+        .args(extra)
+        .env("CARGO_TARGET_DIR", common::shared_target_dir());
     c.output().expect("run init")
 }
 
