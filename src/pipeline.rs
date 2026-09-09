@@ -57,6 +57,19 @@ fn reborrow_log<'a>(log: &'a mut Option<&mut dyn Write>) -> Option<&'a mut dyn W
     }
 }
 
+/// The result for an experiment `stop --force` cancelled before it could
+/// finish. Not a verdict — `program.md` documents `ABORTED` as an
+/// interrupted experiment, distinct from the four real outcomes — and
+/// `eval` (the command) never writes a `results.tsv` row for it: nothing
+/// was measured, so nothing is recorded.
+fn aborted() -> VerdictResult {
+    verdict::gate(
+        Status::Aborted,
+        Reason::StopForced,
+        "cancelled by 'stop --force' before this experiment finished",
+    )
+}
+
 /// Gates, measures and scores one experiment.
 ///
 /// Returns a terminal verdict for every gate outcome and every completed
@@ -66,6 +79,14 @@ pub fn eval(
     o: &mut Options,
     mut log: Option<&mut dyn Write>,
 ) -> Result<(VerdictResult, Option<Measurements>), String> {
+    // Checked before gate 1: a `stop --force` that arrives while `eval` is
+    // still doing setup (resolving the run, loading the baseline — none of
+    // which spawns a subprocess for `Runner` to catch it in) must not run
+    // any of the gates below at all.
+    if state::CANCEL_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok((aborted(), None));
+    }
+
     let timeout = o.cfg.timeout_duration()?;
 
     // 1. Scope, and 2. locked files. Checked before anything is restored or
@@ -263,6 +284,12 @@ pub fn eval(
         &["build", "--release", "--all-targets", "--workspace"],
         reborrow_log(&mut log),
     )?;
+    // Checked before `timed_out`/`ok()`: a build killed by `stop --force`
+    // exits non-zero exactly like a real build failure would, and reporting
+    // it as BuildFailed would be actively misleading about what happened.
+    if out.cancelled {
+        return Ok((aborted(), None));
+    }
     if out.timed_out {
         return Ok((
             verdict::gate(Status::Crash, Reason::Timeout, "cargo build timed out"),
@@ -283,6 +310,9 @@ pub fn eval(
     //    nearest thing Rust has to the extra checking `go vet` and `-race`
     //    bought the Go original.
     let out = runner.cargo(&["test", "--workspace"], reborrow_log(&mut log))?;
+    if out.cancelled {
+        return Ok((aborted(), None));
+    }
     if out.timed_out {
         return Ok((
             verdict::gate(Status::Crash, Reason::Timeout, "cargo test timed out"),
@@ -344,6 +374,11 @@ pub fn eval(
     };
     let (base_set, cand_set) = match measure::run(&opts, reborrow_log(&mut log)) {
         Ok(sets) => sets,
+        // `stop --force` mid-measurement: nothing was fully measured, so
+        // this is an abandoned experiment, not a broken one — checked
+        // before the generic error case below, which would otherwise
+        // report it as a build failure.
+        Err(e) if e == measure::CANCELLED_SENTINEL => return Ok((aborted(), None)),
         // A benchmark that will not run is a broken candidate, not a broken
         // harness: report it as a verdict so the loop records a row and
         // carries on rather than stopping the run.

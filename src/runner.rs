@@ -1,8 +1,10 @@
 //! Executes cargo subcommands with a timeout and captured output.
 
+use crate::state::CANCEL_REQUESTED;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -64,6 +66,12 @@ pub struct Output {
     pub stderr: Vec<u8>,
     pub exit_code: i32,
     pub timed_out: bool,
+    /// Set when this command was killed because `state::CANCEL_REQUESTED`
+    /// became true mid-run — a human's `stop --force`, not a timeout and not
+    /// an ordinary non-zero exit. A caller that only checked `ok()` would
+    /// otherwise report this as a build or test failure instead of the
+    /// abandoned experiment it actually is.
+    pub cancelled: bool,
     pub duration: Duration,
 }
 
@@ -172,6 +180,7 @@ impl Runner {
         });
 
         let mut timed_out = false;
+        let mut cancelled = false;
         let status = loop {
             // Check the deadline BEFORE calling try_wait, not after. If the
             // order were reversed, a fast-exiting command racing a very short
@@ -186,6 +195,20 @@ impl Runner {
                 procgroup::kill_tree(&mut child);
                 timed_out = true;
                 break child.wait().map_err(|e| format!("wait after kill: {e}"))?;
+            }
+            // Checked every poll tick, not just between top-level gates: a
+            // human's `stop --force` should not have to wait out an entire
+            // `cargo build` or `cargo bench` round before it takes effect.
+            // Killing the process the SAME way a timeout does reuses the
+            // exact process-group teardown Task 10 already proved correct,
+            // so a cancelled subprocess never leaves an orphaned benchmark
+            // burning CPU behind it either.
+            if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                procgroup::kill_tree(&mut child);
+                cancelled = true;
+                break child
+                    .wait()
+                    .map_err(|e| format!("wait after cancel: {e}"))?;
             }
             match child.try_wait().map_err(|e| format!("wait: {e}"))? {
                 Some(status) => break status,
@@ -207,6 +230,7 @@ impl Runner {
             stderr,
             exit_code: status.code().unwrap_or(-1),
             timed_out,
+            cancelled,
             duration: start.elapsed(),
         })
     }
@@ -254,6 +278,7 @@ mod tests {
             stderr: Vec::new(),
             exit_code: 1,
             timed_out: false,
+            cancelled: false,
             duration: Duration::ZERO,
         };
         assert_eq!(out.tail(2), "b\nc");

@@ -13,21 +13,29 @@
 //! Both leave the repository on the run branch with every kept commit
 //! intact.
 //!
-//! `--force`'s signal is best-effort: this build has no mechanism recording
-//! a running `eval`'s process id anywhere `stop` can read it back from (that
-//! is a `cmd_eval` change, out of this task's scope), so today `--force`
-//! always reports "no eval running" and falls straight through to reporting
-//! repository state. The stop request itself is written regardless, so a
-//! well-behaved agent still stops at its next verdict either way.
+//! On unix, `--force` sends a real `SIGTERM` to a verified-LIVE `eval`
+//! process (see `autor3search::state::eval_running`, which tells a live
+//! claim from a pid file a crashed eval left behind) and waits briefly for
+//! it to exit on its own — `eval`'s own signal handler sets
+//! `state::CANCEL_REQUESTED`, which the pipeline and `Runner::cargo` check
+//! between gates and between measurement rounds, so the process gets a
+//! chance to record `ABORTED`/`stop_forced` and tear down its own benchmark
+//! subprocess cleanly. Windows has no such polite half — see [`terminate`]
+//! — so there `--force` ends the process outright, and the killed `eval`
+//! never gets to record what it abandoned.
 
 use crate::args::Args;
 use autor3search::{gitx, state};
 use std::path::Path;
+use std::time::Duration;
 
-/// The pid file a future `cmd_eval` could write inside the run's state
-/// directory while an experiment is in flight, naming the `eval` process to
-/// signal. Nothing writes this file today; see the module doc comment.
-const EVAL_PID_FILE: &str = "eval.pid";
+/// How long `--force` waits for a signalled `eval` to release its claim
+/// before giving up and reporting the repository state regardless. Not an
+/// escalation to a harder kill signal — see the module doc comment on why a
+/// stuck `eval` is a courtesy wait, not something this command tries to
+/// clean up further by force.
+const FORCE_GRACE: Duration = Duration::from_secs(10);
+const FORCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn run(argv: &[String]) -> i32 {
     let args = match Args::parse(
@@ -109,49 +117,98 @@ fn stop(args: &Args) -> Result<String, String> {
     Ok(out)
 }
 
-/// Best-effort SIGTERM to a recorded `eval` pid — see the module doc comment
-/// for why this almost always reports "no eval running" in this build.
+/// Signals a live `eval`, if one holds the run's claim, and reports what
+/// happened. See [`terminate`] for the unix/Windows split.
 fn force_signal(dir: &Path) -> String {
-    match read_eval_pid(dir) {
-        Some(pid) if process_alive(pid) => {
-            let mut out = format!("signalling eval (pid {pid})...\n");
-            if terminate(pid) {
-                out.push_str("sent SIGTERM\n");
-            } else {
-                out.push_str("failed to signal the process; it may have already exited\n");
-            }
-            out
-        }
-        _ => "no eval running — nothing to signal\n".to_string(),
+    let live = match state::eval_running(dir) {
+        Ok(p) => p,
+        Err(e) => return format!("could not tell whether an eval is running: {e}\n"),
+    };
+    let Some(pid) = live else {
+        return "no eval running — nothing to signal\n".to_string();
+    };
+
+    let mut out = format!("signalling eval (pid {pid})...\n");
+    if !terminate(pid) {
+        out.push_str("failed to signal the process; it may have already exited\n");
+        return out;
     }
+
+    if cfg!(unix) {
+        out.push_str("sent SIGTERM; waiting for it to finish aborting...\n");
+        if wait_for_release(dir, FORCE_GRACE) {
+            out.push_str("eval exited\n");
+        } else {
+            out.push_str(&format!(
+                "eval did not exit within {:?}; it may still be tearing down its benchmark \
+                 subprocess — check again with `autor3search-rust status`\n",
+                FORCE_GRACE
+            ));
+        }
+    } else {
+        // TerminateProcess is immediate and gives the target no chance to
+        // run its own cleanup, so the claim it held has to be cleared here
+        // instead — `eval` never gets back to `EvalClaim::drop` to do it
+        // itself.
+        out.push_str("eval terminated (no graceful shutdown on this platform)\n");
+        let _ = state::clear_eval_pid(dir);
+    }
+    out
 }
 
-fn read_eval_pid(dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(dir.join(EVAL_PID_FILE))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-}
-
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 sends nothing; it only probes whether the pid exists
-    // and is signalable by this process.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+/// Polls until no live process holds the run's claim, or `grace` runs out.
+///
+/// Polls [`state::eval_running`] rather than the pid directly: a signalled
+/// process that has died but not yet been reaped by its parent is a
+/// ZOMBIE, and a liveness probe against the bare pid can still say yes for
+/// one. `eval_running`'s claim is a kernel `flock` released the moment the
+/// process exits by any means, zombie or not, so it is the honest signal.
+fn wait_for_release(dir: &Path, grace: Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match state::eval_running(dir) {
+            Ok(None) | Err(_) => return true,
+            Ok(Some(_)) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(FORCE_POLL_INTERVAL);
+    }
 }
 
 #[cfg(unix)]
 fn terminate(pid: u32) -> bool {
-    // SAFETY: same as `process_alive` — sending a real signal to a pid we
-    // just confirmed is alive and ours to signal.
+    // SAFETY: sends a real signal to a pid `state::eval_running` just
+    // confirmed holds this run's live claim.
     unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
 }
 
-#[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
-    false
+/// Windows has no `SIGTERM` a process can catch and act on mid-benchmark, so
+/// there is no polite half here: this ends the process outright, and it
+/// never gets to record what it abandoned or clean up its own claim (see
+/// [`force_signal`], which clears it afterward instead).
+///
+/// UNVERIFIED on this platform: developed without access to a Windows
+/// machine. Uses only `Win32_System_Threading` and `Win32_Foundation`,
+/// already enabled in `Cargo.toml` for `procgroup_windows.rs`'s job-object
+/// machinery — no new dependency or feature. CI covers Windows.
+#[cfg(windows)]
+fn terminate(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(handle, 1) != 0;
+        CloseHandle(handle);
+        ok
+    }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn terminate(_pid: u32) -> bool {
     false
 }

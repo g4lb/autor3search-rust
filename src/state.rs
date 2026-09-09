@@ -11,6 +11,7 @@ use crate::config::BenchTarget;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 /// The per-repository state directory name under the user cache.
 pub const STATE_DIR_NAME: &str = "autor3search-rust";
@@ -31,6 +32,12 @@ pub const WORKTREE_NAME: &str = "baseline-worktree";
 pub const CRITERION_DIR: &str = "criterion";
 pub const PROFILES_DIR: &str = "profiles";
 pub const STOP_FILE: &str = "stop";
+/// Holds the pid of the currently running `eval`, written on start and
+/// removed on exit — see [`claim_eval`]. It answers a different question
+/// than [`STOP_FILE`]: that one is a REQUEST the agent reads and acts on at
+/// its own pace; this one identifies who to signal when a human cannot wait
+/// for that.
+pub const EVAL_PID_FILE: &str = "eval.pid";
 
 /// The run branch for a tag.
 pub fn branch_name(tag: &str) -> String {
@@ -217,6 +224,200 @@ pub fn stop_requested(state_dir: &Path) -> bool {
     state_dir.join(STOP_FILE).exists()
 }
 
+/// Set when a human's `stop --force` has asked the currently running `eval`
+/// to abandon its experiment now, rather than finish it. `eval` installs a
+/// `SIGTERM` handler that sets this; the pipeline and [`crate::runner`]
+/// check it between gates and between measurement rounds, aborting promptly
+/// rather than running to completion first.
+///
+/// A process-wide static, not something threaded through `pipeline::Options`
+/// or `measure::Options`, so that checking it needs no change to either
+/// struct's shape — every existing constructor of both keeps compiling
+/// unchanged, and nothing outside a real `eval` process (which is the only
+/// thing that ever sets it) is affected. It starts `false` in every process
+/// and is set at most once, by that process's own signal handler, so it
+/// carries no cross-process or cross-test-thread hazard: `cargo test` never
+/// sets it, only the compiled binary's own `SIGTERM` handler does, in its
+/// own separate process.
+pub static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// A live claim on a run's `eval.pid` file, held for the life of the current
+/// experiment. Dropping releases it.
+///
+/// On unix the claim is a real, kernel-enforced guarantee: it is an
+/// exclusive `flock` held on the open file descriptor, which the kernel
+/// releases the moment this process exits **by any means** — a clean
+/// return, an early `?`, a panic, or a `SIGKILL` that runs no destructor at
+/// all. That is exactly the property [`eval_running`] depends on to tell a
+/// live claim from a pid file a crashed `eval` left behind: a bare
+/// "does this file exist" check could not offer it, and without it a stale
+/// file plus a recycled pid could eventually make `stop --force` signal a
+/// process that has nothing to do with this run.
+///
+/// On non-unix platforms there is no such lock implemented here (see the
+/// module's `#[cfg(not(unix))]` fallback): the pid is still written on claim
+/// and removed on every exit path this process reaches normally, but a
+/// process that dies without unwinding leaves a stale file with no way to
+/// tell it apart from a live one by inspecting the file alone. This is a
+/// real, disclosed gap on that platform, not a guarantee — see the Task 19
+/// report.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct EvalClaim {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for EvalClaim {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `self.file` is a valid, open file descriptor for as long
+        // as `self` exists.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Claims this run's `eval` slot for the current process. Fails if another
+/// live process already holds the claim — two concurrent `eval`s against
+/// the same run would fight over the same pinned worktree — naming the
+/// incumbent pid rather than silently proceeding.
+#[cfg(unix)]
+pub fn claim_eval(state_dir: &Path) -> Result<EvalClaim, String> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| format!("create {}: {e}", state_dir.display()))?;
+    let path = state_dir.join(EVAL_PID_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        // Deliberately not truncated on open: another process's content
+        // must not be discarded before the lock below confirms nobody else
+        // holds the claim. `set_len(0)` truncates explicitly, AFTER that
+        // check succeeds.
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    // SAFETY: `file` is a valid, open file descriptor for the duration of
+    // this call.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !locked {
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        return Err(format!(
+            "another autor3search-rust eval (pid {}) is already running for this run — two \
+             concurrent evals would fight over the same pinned worktree",
+            existing.trim()
+        ));
+    }
+    file.set_len(0)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    writeln!(file, "{}", std::process::id())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    file.flush()
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(EvalClaim { file, path })
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct EvalClaim {
+    path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl Drop for EvalClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// See [`EvalClaim`]'s doc comment: on this platform the pid is recorded
+/// with no lock behind it, so a process that dies without unwinding leaves
+/// a file [`eval_running`] cannot tell from a live one.
+#[cfg(not(unix))]
+pub fn claim_eval(state_dir: &Path) -> Result<EvalClaim, String> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| format!("create {}: {e}", state_dir.display()))?;
+    let path = state_dir.join(EVAL_PID_FILE);
+    std::fs::write(&path, format!("{}\n", std::process::id()))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(EvalClaim { path })
+}
+
+/// The pid recorded for this run's in-flight `eval`, if any. Does not check
+/// liveness — see [`EvalClaim`] and [`eval_running`] for that.
+pub fn eval_pid(state_dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(state_dir.join(EVAL_PID_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Removes a pid file left behind by an eval that died without releasing
+/// its claim, or one killed from outside in a way that skips its own
+/// cleanup (Windows `TerminateProcess`; see `cmd_stop`). Removing one that
+/// is not there is not an error.
+pub fn clear_eval_pid(state_dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(state_dir.join(EVAL_PID_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("clear eval pid: {e}")),
+    }
+}
+
+/// The pid of the run's in-flight `eval`, when a LIVE process still holds
+/// the claim — distinguishing that from a pid file left behind by one that
+/// died without releasing it (a `SIGKILL`, a panic, a crash).
+///
+/// Answers by attempting a SHARED lock on the same file [`claim_eval`] locks
+/// exclusively: taking it succeeds only when nothing holds the exclusive
+/// lock, which means the file — if present at all — is a leftover, not a
+/// live claim.
+#[cfg(unix)]
+pub fn eval_running(state_dir: &Path) -> Result<Option<u32>, String> {
+    use std::os::unix::io::AsRawFd;
+    let path = state_dir.join(EVAL_PID_FILE);
+    let Some(pid) = eval_pid(state_dir) else {
+        return Ok(None);
+    };
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("open {}: {e}", path.display())),
+    };
+    // SAFETY: `file` is open for the duration of this call.
+    let took_shared = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0;
+    if took_shared {
+        // Nobody held the exclusive lock, so this pid file is a leftover.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        Ok(None)
+    } else {
+        Ok(Some(pid))
+    }
+}
+
+/// No lock-based liveness check is implemented on this platform (see
+/// [`EvalClaim`]): this reports the recorded pid as-is, whether or not the
+/// process it names is still the one that wrote it.
+#[cfg(not(unix))]
+pub fn eval_running(state_dir: &Path) -> Result<Option<u32>, String> {
+    Ok(eval_pid(state_dir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +582,66 @@ mod tests {
         assert!(!stop_requested(d.path()));
         // Clearing when nothing is pending is not an error.
         assert!(clear_stop(d.path()).is_ok());
+    }
+
+    #[test]
+    fn a_claim_records_the_real_pid_and_is_seen_as_running() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(eval_pid(d.path()), None);
+        assert_eq!(eval_running(d.path()).unwrap(), None);
+
+        let claim = claim_eval(d.path()).unwrap();
+        assert_eq!(eval_pid(d.path()), Some(std::process::id()));
+        assert_eq!(eval_running(d.path()).unwrap(), Some(std::process::id()));
+
+        drop(claim);
+        assert_eq!(
+            eval_pid(d.path()),
+            None,
+            "dropping the claim removes the pid file"
+        );
+        assert_eq!(eval_running(d.path()).unwrap(), None);
+    }
+
+    // A second claim on the same run must fail, naming the incumbent, not
+    // silently overwrite it — two concurrent evals would fight over the
+    // same pinned worktree.
+    #[test]
+    fn a_second_claim_on_the_same_run_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let _first = claim_eval(d.path()).unwrap();
+        let err = claim_eval(d.path()).unwrap_err();
+        assert!(err.contains(&std::process::id().to_string()), "{err}");
+    }
+
+    // A pid file left behind by an eval that died without releasing its
+    // claim (no flock held on it) must read as NOT running, not as a live
+    // one — this is what lets `stop --force` tell a stale leftover apart
+    // from a real process to signal, and it is why the claim is a kernel
+    // lock rather than a bare "does this file exist" check.
+    #[test]
+    fn a_pid_file_with_no_lock_behind_it_is_not_running() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(EVAL_PID_FILE), "999999\n").unwrap();
+        assert_eq!(eval_pid(d.path()), Some(999999));
+        assert_eq!(
+            eval_running(d.path()).unwrap(),
+            None,
+            "a pid file nobody holds a lock on is a leftover, not a live claim"
+        );
+    }
+
+    #[test]
+    fn clearing_a_pid_file_that_is_not_there_is_not_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(clear_eval_pid(d.path()).is_ok());
+    }
+
+    #[test]
+    fn clear_eval_pid_removes_a_leftover_file() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(EVAL_PID_FILE), "123\n").unwrap();
+        clear_eval_pid(d.path()).unwrap();
+        assert_eq!(eval_pid(d.path()), None);
     }
 }

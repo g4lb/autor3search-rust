@@ -1,7 +1,7 @@
 //! Shared fixture for the command-level integration tests.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 /// Runs the compiled binary against `repo`, pointed at its own out-of-tree
 /// state home so tests never touch the developer's real cache.
@@ -19,6 +19,27 @@ pub fn run_cli(repo: &TestRepo, args: &[&str]) -> Output {
         .env("AUTOR3SEARCH_RUST_STATE_HOME", repo.state_home())
         .output()
         .expect("run command")
+}
+
+/// Starts the compiled binary against `repo` WITHOUT waiting for it, for a
+/// test that needs to interact with a still-running command — e.g. sending
+/// it `stop --force` while it is in the middle of an experiment. Stdout and
+/// stderr are piped so the caller can read them once the child exits, the
+/// same as `run_cli`'s captured `Output`.
+///
+/// Only the `stop --force` abort test in `tests/cmd_eval.rs` uses this
+/// today, so it carries `#[allow(dead_code)]` like every other helper here.
+#[allow(dead_code)]
+pub fn spawn_cli(repo: &TestRepo, args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_autor3search-rust"))
+        .args(args)
+        .arg("-C")
+        .arg(repo.path())
+        .env("AUTOR3SEARCH_RUST_STATE_HOME", repo.state_home())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn command")
 }
 
 /// Runs a git command in `root`, panicking on failure. For test setup only.
