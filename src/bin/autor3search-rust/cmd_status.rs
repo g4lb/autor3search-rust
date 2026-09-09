@@ -92,10 +92,24 @@ fn status(args: &Args) -> Result<String, String> {
     if worktree.is_dir() {
         out.push_str(&format!("{:<14} {}\n", "worktree", worktree.display()));
     } else {
+        // `baseline --tag {tag} --force` cannot fix this: its tag-collision
+        // check is unconditional (see `cmd_baseline.rs`) and refuses to run
+        // again for a tag that already has a baseline, --force or not —
+        // --force only ever gates the separate results.tsv check. The
+        // worktree is the only thing missing here (baseline.json, just
+        // loaded above, is fine), so the real fix is recreating just it, by
+        // hand, at the commit this run is actually measuring against.
         out.push_str(&format!(
-            "{:<14} {}  (MISSING — re-run `autor3search-rust baseline --tag {tag} --force`)\n",
+            "{:<14} {}  (MISSING — recreate it by hand:\n{:<16}git -C {} worktree add \
+             --detach -f {} {}\n{:<16}'baseline --tag {tag} --force' will NOT do this: a tag \
+             that already has a baseline is always refused, --force or not)\n",
             "worktree",
-            worktree.display()
+            worktree.display(),
+            "",
+            root.display(),
+            worktree.display(),
+            baseline.measure_commit,
+            "",
         ));
     }
     out.push_str(&experiments_line(&root));

@@ -131,6 +131,59 @@ pub fn eval(
         }
     }
 
+    // 2b. Locked files, independent of git. The loop above only ever sees
+    //     what `git diff`/`git status` report, and both omit gitignored
+    //     paths — so a repository (or config) that gitignores `Cargo.lock`,
+    //     or an agent that edits an in-scope `.gitignore` to add `.cargo/`
+    //     before creating `.cargo/config.toml`, would sail through it
+    //     untouched. This stats every locked path directly instead of
+    //     trusting git's view, so it catches exactly that. Defence in depth,
+    //     not a replacement for the check above.
+    let current_locked: std::collections::BTreeMap<String, String> =
+        discover::locked_files(&o.root)?
+            .into_iter()
+            .map(|rel| {
+                let hash = freeze::sha256_file(&o.root.join(&rel))?;
+                Ok::<_, String>((rel, hash))
+            })
+            .collect::<Result<_, String>>()?;
+    if current_locked != o.baseline.locked_files {
+        let mut details: Vec<String> = Vec::new();
+        for (rel, hash) in &current_locked {
+            match o.baseline.locked_files.get(rel) {
+                None => details.push(format!(
+                    "{rel} added: {}",
+                    scope::locked_file(rel).unwrap_or("locked at any depth")
+                )),
+                Some(h) if h != hash => details.push(format!(
+                    "{rel} modified: {}",
+                    scope::locked_file(rel).unwrap_or("locked at any depth")
+                )),
+                _ => {}
+            }
+        }
+        for rel in o.baseline.locked_files.keys() {
+            if !current_locked.contains_key(rel) {
+                details.push(format!(
+                    "{rel} removed: {}",
+                    scope::locked_file(rel).unwrap_or("locked at any depth")
+                ));
+            }
+        }
+        return Ok((
+            verdict::gate(
+                Status::Fail,
+                Reason::ScopeViolation,
+                format!(
+                    "locked file(s) changed since baseline, independent of what git reports as \
+                     changed (this catches a gitignored locked path): {}",
+                    details.join("; ")
+                ),
+            ),
+            None,
+        ));
+    }
+
     // 3. Config integrity. config.yaml lives in the repo because humans own
     //    it, which means the agent can reach it; raising max_regress_pct or
     //    dropping a benchmark would defeat the guard.
@@ -414,9 +467,114 @@ pub fn eval(
 /// Without this, every experiment after the first kept one is measured against
 /// the run's ORIGINAL commit forever, so a later no-op that merely fails to
 /// regress an EARLIER improvement still banks as KEEP.
+///
+/// Moves the worktree FIRST, then persists — and rolls the checkout back to
+/// `old_commit` if the save fails, rather than persisting first. A failed
+/// `save` (disk full — this project has hit that twice during its own
+/// development) is a harness malfunction, not tampering, and it must not be
+/// allowed to look like one: left un-rolled-back, the worktree would sit at
+/// `new_commit` while `baseline.json` on disk still names `old_commit` (this
+/// function never wrote it), and gate 9 on the very next `eval` would see
+/// that mismatch and report `FAIL(baseline_tampered)` — blaming tampering
+/// for a failed write and bricking an otherwise-fine overnight run. Rolling
+/// the checkout back instead restores the one invariant gate 9 checks
+/// (worktree `HEAD` == the `measure_commit` actually on disk) before this
+/// function returns its error.
 fn advance_measurement_baseline(o: &mut Options) -> Result<(), String> {
+    let old_commit = o.baseline.measure_commit.clone();
     let new_commit = gitx::head_commit(&o.root)?;
-    gitx::checkout_detached(&o.state_dir.join(state::WORKTREE_NAME), &new_commit)?;
-    o.baseline.measure_commit = new_commit;
-    o.baseline.save(&o.state_dir.join(state::BASELINE_FILE))
+    let worktree = o.state_dir.join(state::WORKTREE_NAME);
+
+    gitx::checkout_detached(&worktree, &new_commit)?;
+    o.baseline.measure_commit = new_commit.clone();
+    if let Err(save_err) = o.baseline.save(&o.state_dir.join(state::BASELINE_FILE)) {
+        o.baseline.measure_commit = old_commit.clone();
+        if let Err(rollback_err) = gitx::checkout_detached(&worktree, &old_commit) {
+            return Err(format!(
+                "{save_err}\n\nadditionally, failed to roll the pinned worktree back to \
+                 {old_commit} after that failure: {rollback_err} — it now points at \
+                 {new_commit} while baseline.json on disk still names {old_commit}, which the \
+                 next eval will misreport as FAIL(baseline_tampered). Fix by hand: cd {} && git \
+                 checkout -q -f --detach {old_commit}",
+                worktree.display()
+            ));
+        }
+        return Err(save_err);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // I4: a `save` that fails AFTER the worktree has already moved must not
+    // leave gate 9's invariant broken (pinned worktree HEAD == the
+    // measure_commit actually recorded on disk) — otherwise the very next
+    // eval blames tampering for what was really a failed write. Simulated
+    // portably, with no platform-specific permission bits: a directory
+    // sitting where `baseline.json` needs to be written makes `save` fail
+    // deterministically on every platform.
+    #[test]
+    fn a_failed_save_rolls_the_worktree_checkout_back() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let root = repo_dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "first"]);
+        let first = gitx::head_commit(&root).unwrap();
+
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "second"]);
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let worktree = state_dir.path().join(state::WORKTREE_NAME);
+        gitx::add_worktree(&root, &worktree, &first).unwrap();
+
+        // Force the save to fail: a directory where the file must go.
+        std::fs::create_dir_all(state_dir.path().join(state::BASELINE_FILE)).unwrap();
+
+        let mut o = Options {
+            root: root.clone(),
+            state_dir: state_dir.path().to_path_buf(),
+            cfg: Config::default(),
+            baseline: Baseline {
+                tag: "t".into(),
+                branch: "autor3search-rust/t".into(),
+                commit: first.clone(),
+                measure_commit: first.clone(),
+                created_at: String::new(),
+                benchmarks: Vec::new(),
+                bench_targets: Vec::new(),
+                config_sha256: "0".repeat(64),
+                locked_files: std::collections::BTreeMap::new(),
+            },
+        };
+
+        let err = advance_measurement_baseline(&mut o).unwrap_err();
+        assert!(err.contains("baseline"), "{err}");
+
+        // The worktree must be back at the OLD commit, and the in-memory
+        // record must agree with what is still on disk.
+        assert_eq!(gitx::head_commit(&worktree).unwrap(), first);
+        assert_eq!(o.baseline.measure_commit, first);
+    }
 }
