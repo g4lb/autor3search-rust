@@ -114,6 +114,17 @@ faster. The only harness output that stays inside your repo is
 `results.tsv` (a human-readable log, not part of the metric) and `run.log`
 (subprocess transcripts) — both gitignored by `init`.
 
+**Take "not part of the metric" literally.** `results.tsv` sits in the
+repository, is gitignored, and is skipped by the scope gate, so the agent can
+append whatever rows it likes and nothing will stop it or notice. That does
+not let a bad change through — verdicts come from `eval`, which gates the real
+code — but it does mean `report`'s cumulative figure is only as honest as the
+agent that produced the rows behind it. The authoritative record of what was
+actually kept is the run branch's git history, and the harness's own state
+lives outside the repository where the agent cannot reach it. `program.md`
+tells the agent not to touch `results.tsv`; that is an instruction, not a
+control, and it is the only cheat in this section not closed by code.
+
 There is a fourth kind of test this table doesn't capture: a
 `#[cfg(test)] mod tests` block or a doctest **inside** a `src/**` file you
 are otherwise allowed to edit. Those cannot be frozen as a whole file
