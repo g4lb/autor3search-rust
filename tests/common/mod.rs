@@ -61,6 +61,49 @@ pub fn state_dir(repo: &TestRepo, tag: &str) -> PathBuf {
     panic!("no state dir for tag {tag:?} under {}", home.display());
 }
 
+/// Every path under `root`, paired with its mtime, in a stable order.
+///
+/// Used to prove a command wrote nothing: two snapshots taken either side of
+/// a call are `assert_eq!`-compared wholesale, so a changed mtime on an
+/// untouched file, a file appearing, or a file disappearing all show up as a
+/// diff without either side of the test needing to know in advance which
+/// path a bug might have touched.
+///
+/// Not every test file that pulls in this module uses it, so it carries
+/// `#[allow(dead_code)]` like the rest of this file's helpers.
+#[allow(dead_code)]
+pub fn tree_snapshot(root: &Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        out.push((rel, mtime));
+        if meta.is_dir() {
+            walk(root, &path, out);
+        }
+    }
+}
+
 pub struct TestRepo {
     _dir: tempfile::TempDir,
     root: PathBuf,

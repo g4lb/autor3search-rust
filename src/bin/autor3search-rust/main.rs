@@ -2,8 +2,14 @@ use std::process::ExitCode;
 
 mod args;
 mod cmd_baseline;
+mod cmd_doctor;
 mod cmd_eval;
 mod cmd_init;
+mod cmd_profile;
+mod cmd_report;
+mod cmd_status;
+mod cmd_stop;
+mod cmd_version;
 
 const COMMANDS: &[(&str, &str)] = &[
     (
@@ -53,8 +59,14 @@ fn dispatch(args: &[String]) -> i32 {
     let rest = &args[1..];
     match name.as_str() {
         "init" => cmd_init::run(rest),
+        "doctor" => cmd_doctor::run(rest),
         "baseline" => cmd_baseline::run(rest),
+        "profile" => cmd_profile::run(rest),
         "eval" => cmd_eval::run(rest),
+        "status" => cmd_status::run(rest),
+        "stop" => cmd_stop::run(rest),
+        "report" => cmd_report::run(rest),
+        "version" => cmd_version::run(rest),
         _ => {
             eprintln!("{name}: not implemented yet");
             autor3search::EXIT_USAGE
