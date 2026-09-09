@@ -1,5 +1,8 @@
 # autor3search-rust
 
+[![ci](https://github.com/g4lb/autor3search-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/g4lb/autor3search-rust/actions/workflows/ci.yml?query=branch%3Amain)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **Autonomous AI-driven performance optimization for any Rust repository.**
 
 Point your coding agent at your repo and go to sleep. It proposes an
@@ -7,13 +10,13 @@ optimization, runs it through a frozen measurement harness, and the harness
 decides: **KEEP** or **DISCARD**. You wake up to a log of experiments and
 faster code.
 
-A port of [autor3search-go](https://github.com/g4lb/autor3search-go), which
-does this for Go — where the metric is `ns/op` instead of criterion's
-`estimates.json`, and where **correctness is not optional**. Inspired in turn
-by [karpathy/autoresearch](https://github.com/karpathy/autoresearch), which
-does this for a single-GPU LLM training loop.
+Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch),
+which does this for a single-GPU LLM training loop. This does it for Rust —
+where the metric comes from criterion, where the tests that judge a change
+live inside the files being changed, and where **correctness is not
+optional**.
 
-> **Status: early.** This release is proven by its own test suite — 240+
+> **Status: early but working.** This release is proven by its own test suite — 240+
 > tests, including end-to-end tests that drive `eval` to a real `KEEP` and a
 > real `DISCARD` against the bundled demo crate — and by one real measured
 > run against that crate, recorded in full in
@@ -237,8 +240,7 @@ safer under concurrent invocations, and testable without changing the
 process's own working directory.
 
 Flags are double-dash throughout (`--tag`, `--force`, `--desc`, `--json`,
-`--clear`, `--no-log`), unlike the Go original's single-dash long flags
-(`-tag`, `-force`). This is deliberate, not an oversight: `program.md` and
+`--clear`, `--no-log`). This is deliberate, not an oversight: `program.md` and
 this README are generated for this tool and spell its own flags throughout,
 so nothing an agent copies out of them is wrong. A single-dash long flag
 (`-force`) is refused outright, naming the two-dash spelling in the error,
@@ -475,8 +477,6 @@ improvements compound the way percentage changes do.
 Stated plainly, because performance tools that oversell are worse than
 useless.
 
-**Ported from the Go original, and just as true here:**
-
 - **A `KEEP` is evidence, not proof.** Any fixed significance threshold
   admits some false positives by construction — that's what "alpha" means.
   Measuring genuine no-op trials (a commit that changes only a comment)
@@ -514,7 +514,19 @@ useless.
   technicality, not on its merits. `config.yaml` refuses `count` below 4
   rather than let that happen silently.
 
-**Rust-specific, and new to this port:**
+### Constraints the Rust toolchain imposes
+
+None of these is cosmetic, and none of them is going to change soon.
+
+- **An `eval` compiles the dependency graph twice, in two profiles.** Gate 7
+  builds `--release`, because that is what the benchmarks run as. Gate 8 then
+  runs `cargo test`, which builds the same graph again in `debug` — deliberately,
+  so `debug_assert!` and arithmetic-overflow checks stay armed, but at real
+  cost: measured at 7.5 s on the bundled demo crate, whose entire dependency
+  graph is criterion and its transitives. On a heavier crate this dominates an
+  experiment's wall time more than the benchmark rounds do. The Go original's
+  reasoning that per-round measurement overhead dominates does not carry over
+  here, and this is the reason.
 
 - **No allocation metrics at all.** Go gets `B/op` and `allocs/op` free from
   `-benchmem`. Criterion measures time only, and counting allocations would
@@ -522,9 +534,10 @@ useless.
   harness — editing the very code under measurement. So `results.tsv` drops
   the `allocs_delta` column and carries five fields, not six.
 
-  This costs more than a column. Go's `program.md` idea bank leans on
-  allocation counts as the agent's single best lead for *what to try next*;
-  the Rust idea bank had to be rebuilt around what remains — `samply`'s hot
+  This costs more than a column. An allocation count is often an agent's
+  single best lead for *what to try next* — "this loop allocates 400 times
+  per call" localizes a problem that a wall-clock number does not. The idea
+  bank in `program.md` had to be built around what remains instead — `samply`'s hot
   symbols, plus Rust-specific leads: `String`/`Vec` reallocation and
   `with_capacity`, `clone()` in hot paths, `collect()` into an intermediate
   collection, `Box<dyn Trait>` dynamic dispatch vs generics, iterator chains
