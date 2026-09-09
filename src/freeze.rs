@@ -881,6 +881,11 @@ fn collect_cfg_test(
 /// included path — is hashed, so a changed path is still detected even
 /// though the included file's content is not.
 fn collect_docs(attrs: &[syn::Attribute], out: &mut String) {
+    // One item's doc comment is assembled whole before its doctests are
+    // extracted, so a fence opened on one item can never swallow the next
+    // item's documentation.
+    let mut text = String::new();
+    let mut macros = String::new();
     for attr in attrs {
         if !attr.path().is_ident("doc") {
             continue;
@@ -893,14 +898,62 @@ fn collect_docs(attrs: &[syn::Attribute], out: &mut String) {
                 lit: syn::Lit::Str(s),
                 ..
             }) => {
-                out.push_str(&s.value());
-                out.push('\n');
+                text.push_str(&s.value());
+                text.push('\n');
             }
+            // `#[doc = include_str!("...")]`. The included file is not
+            // visible here, so the invocation's own tokens are hashed
+            // verbatim: a changed path is caught, a changed file is not.
             syn::Expr::Macro(syn::ExprMacro { mac, .. }) => {
-                out.push_str(&mac.to_token_stream().to_string());
-                out.push('\n');
+                macros.push_str(&mac.to_token_stream().to_string());
+                macros.push('\n');
             }
             _ => {}
+        }
+    }
+    collect_fenced_code(&text, out);
+    out.push_str(&macros);
+}
+
+/// Appends the fenced code blocks in one doc comment — a doctest's actual
+/// content — and nothing else.
+///
+/// Prose is deliberately excluded. Hashing whole doc comments made the gate
+/// fire when an agent added a plain `///` sentence to code it had just
+/// written, which is documentation, not a weakened test. The fence lines
+/// themselves are kept because the info string is part of the doctest:
+/// turning ```` ``` ```` into ```` ```ignore ````, ```` ```no_run ```` or
+/// ```` ```text ```` disables it without touching its body.
+///
+/// An unclosed fence runs to the end of the doc comment, which keeps the
+/// content in rather than dropping it.
+fn collect_fenced_code(doc: &str, out: &mut String) {
+    let mut fence: Option<(char, usize)> = None;
+    for line in doc.lines() {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
+        let run = match marker {
+            Some(c) => trimmed.chars().take_while(|x| *x == c).count(),
+            None => 0,
+        };
+        match fence {
+            None => {
+                if run >= 3 {
+                    fence = Some((marker.expect("a run implies a marker"), run));
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            Some((open_char, open_len)) => {
+                out.push_str(line);
+                out.push('\n');
+                // A closing fence is the same character, at least as long,
+                // and carries no info string.
+                if marker == Some(open_char) && run >= open_len && trimmed[run..].trim().is_empty()
+                {
+                    fence = None;
+                }
+            }
         }
     }
 }
@@ -1368,6 +1421,77 @@ mod tests {
         assert_ne!(
             inline_hashes(WITH_INLINE).unwrap().doc,
             inline_hashes(&weakened).unwrap().doc
+        );
+    }
+
+    // Found running against unicode-segmentation: hashing every doc-comment
+    // line meant adding a brand-new plain-prose `///` sentence to brand-new
+    // code tripped FAIL(inline_test_modified). That is documentation, not a
+    // weakened test, and the agent is entitled to write it. Only fenced code
+    // — the doctest itself — is hashed.
+    #[test]
+    fn adding_plain_prose_doc_comments_does_not_change_the_doc_hash() {
+        let documented = WITH_INLINE.replace(
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+            "/// Now uses a wrapping add, which is what the hot path wants.\npub fn add(a: i32, b: i32) -> i32 { a + b }",
+        );
+        assert_eq!(
+            inline_hashes(WITH_INLINE).unwrap().doc,
+            inline_hashes(&documented).unwrap().doc
+        );
+    }
+
+    // The exact shape reported against unicode-segmentation: the agent adds
+    // a new, documented function to a file that already has doctests
+    // elsewhere, and the gate fires on the new prose.
+    #[test]
+    fn documenting_a_newly_added_function_does_not_change_the_doc_hash() {
+        let extended = format!(
+            "{WITH_INLINE}\n/// An ASCII fast path for the common case.\n///\n/// Falls back to the general routine for anything else.\npub fn add_fast(a: i32, b: i32) -> i32 {{ a.wrapping_add(b) }}\n"
+        );
+        assert_eq!(
+            inline_hashes(WITH_INLINE).unwrap().doc,
+            inline_hashes(&extended).unwrap().doc
+        );
+    }
+
+    // Rewriting the prose around a doctest, without touching the doctest,
+    // is likewise the agent's business and not the gate's.
+    #[test]
+    fn rewriting_prose_around_a_doctest_does_not_change_the_doc_hash() {
+        let reworded = WITH_INLINE.replace("/// Adds two numbers.", "/// Sums a pair.");
+        assert_eq!(
+            inline_hashes(WITH_INLINE).unwrap().doc,
+            inline_hashes(&reworded).unwrap().doc
+        );
+    }
+
+    // The fence's info string is part of the doctest: `ignore` and `no_run`
+    // stop it running, and `text` stops it being a doctest at all, none of
+    // which touch a line of its body. Hashing only the body would let an
+    // agent switch every doctest off and keep the gate quiet.
+    #[test]
+    fn disabling_a_doctest_through_its_fence_changes_the_doc_hash() {
+        for info in ["ignore", "no_run", "text", "compile_fail"] {
+            let disabled = WITH_INLINE.replacen("/// ```", &format!("/// ```{info}"), 1);
+            assert_ne!(
+                inline_hashes(WITH_INLINE).unwrap().doc,
+                inline_hashes(&disabled).unwrap().doc,
+                "turning the fence into ```{info} must change the doc hash"
+            );
+        }
+    }
+
+    // Deleting the doctest outright is the bluntest weakening there is.
+    #[test]
+    fn deleting_a_doctest_changes_the_doc_hash() {
+        let deleted = WITH_INLINE.replace(
+            "/// ```\n/// assert_eq!(demo::add(1, 2), 3);\n/// ```\n",
+            "",
+        );
+        assert_ne!(
+            inline_hashes(WITH_INLINE).unwrap().doc,
+            inline_hashes(&deleted).unwrap().doc
         );
     }
 
