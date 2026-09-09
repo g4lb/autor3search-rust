@@ -225,7 +225,7 @@ special: clear any pending stop and point the agent back at `program.md`.
 | Command | What it does |
 |---|---|
 | `init` | Scans the repo with `cargo metadata` and criterion `--list`, and writes `.autor3search/config.yaml` + `program.md`. Refuses to overwrite an existing config without `--force`. |
-| `doctor` | Checks whether this machine can measure reliably (CPU frequency scaling, thermal throttling risk, load average, disk space, on-battery, `CARGO_INCREMENTAL`, a `[profile.bench]` override, a nightly default toolchain) and prints its findings. Informational — always exits 0. |
+| `doctor` | Checks whether this machine can measure reliably (CPU frequency scaling, thermal throttling risk, load average, disk space, on-battery, `CARGO_INCREMENTAL`, a `[profile.bench]` override, a nightly default toolchain) and prints its findings. Load average and disk space are unix-only — there is no portable equivalent — so on Windows it warns you about less. Informational — always exits 0. |
 | `baseline --tag <tag>` | Creates the run branch `autor3search-rust/<tag>`, freezes every in-scope `tests/**`/`benches/**` file, hashes every in-scope `src/**` file's inline tests and doctests, hashes every locked file present on disk, and pins a detached worktree at the baseline commit. Refuses a dirty tree and a reused tag. |
 | `profile` | Runs the declared benchmarks under criterion's `--profile-time` with [samply](https://github.com/mstange/samply) attached, and prints the top self-time symbols — real sampling-profiler data on where time actually goes, rather than an agent guessing from reading source. When samply is not installed, prints how to install it (`cargo install samply`) and exits 0 rather than failing the run. |
 | `eval` | Runs one experiment: gates (scope, locked files, config integrity, restore, inline-test check, frozen-set check, build, test, worktree integrity), measures the candidate against the pinned baseline worktree, scores it, appends a `results.tsv` row, exits `0`/`1`/`2`/`3` for KEEP/DISCARD/FAIL/CRASH, and on `KEEP` re-points the pinned worktree at the candidate's commit so the next `eval` measures against it (see [Scoring](#scoring)). |
@@ -517,6 +517,17 @@ useless.
 ### Constraints the Rust toolchain imposes
 
 None of these is cosmetic, and none of them is going to change soon.
+
+- **On Windows, a timed-out command may not take its whole process tree.**
+  On unix the harness puts each command in its own process group and signals
+  the group, so a benchmark started as a grandchild dies with it. Windows has
+  no process groups, so the equivalent is a job object built at kill time and
+  handed the already-running child. Assigning a running process to a job
+  normally succeeds, but the return value is not checked: if it fails, the
+  job terminates nothing and the fallback reaps only the direct child,
+  leaving a benchmark binary running — burning CPU and corrupting every later
+  measurement on that machine. Unverified on Windows hardware, like the rest
+  of this list.
 
 - **The symlink defenses are verified on unix only.** A locked file reached
   through a symlink — a `.cargo` directory standing in for one elsewhere, say
