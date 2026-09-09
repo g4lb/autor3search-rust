@@ -156,13 +156,20 @@ pub fn bench_targets(root: &Path) -> Result<Vec<BenchTargetInfo>, String> {
 
 /// Extracts benchmark names from criterion's `--list` output.
 ///
-/// Criterion prints one `<name>: benchmark` line per benchmark, mixed in with
-/// cargo's own build chatter and a possible gnuplot notice, so the suffix is
-/// what identifies a real line.
+/// Criterion prints one line per benchmark, mixed in with cargo's own build
+/// chatter and a possible gnuplot notice, so the suffix is what identifies a
+/// real line. Criterion 0.5 and later write `<name>: benchmark`; 0.3.x and
+/// 0.4.x write `<name>: bench`. Both are accepted, because rejecting the
+/// older form made `init` report "no benchmarks found" for crates whose
+/// criterion benchmarks work perfectly well.
 pub fn parse_list_output(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .filter_map(|line| line.trim_end().strip_suffix(": benchmark"))
+        .filter_map(|line| {
+            let line = line.trim_end();
+            line.strip_suffix(": benchmark")
+                .or_else(|| line.strip_suffix(": bench"))
+        })
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
@@ -449,6 +456,26 @@ parse/large: benchmark
     #[test]
     fn list_output_with_no_benchmarks_yields_nothing() {
         assert!(parse_list_output("Gnuplot not found, using plotters backend\n").is_empty());
+    }
+
+    // Criterion 0.3.x and 0.4.x end each `--list` line in ": bench", not
+    // ": benchmark". Matching only the newer suffix made `init` report "no
+    // benchmarks found" against crates that have real, working criterion
+    // benchmarks — seen on httparse (criterion 0.3.6) and bytecount (0.4.0).
+    const LIST_OUTPUT_OLD_CRITERION: &str = "\
+    Finished `bench` profile [optimized] target(s) in 0.03s
+     Running benches/parse.rs (target/release/deps/parse-1a2b3c4d)
+Gnuplot not found, using plotters backend
+header/count_008: bench
+version/http10: bench
+";
+
+    #[test]
+    fn list_output_from_criterion_0_3_and_0_4_is_parsed_too() {
+        assert_eq!(
+            parse_list_output(LIST_OUTPUT_OLD_CRITERION),
+            vec!["header/count_008", "version/http10"]
+        );
     }
 
     const BENCH_SRC: &str = r#"
