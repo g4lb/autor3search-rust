@@ -27,6 +27,26 @@ pub struct InlineHashes {
     pub cfg_test: String,
     /// Over every doc-comment line, which is a doctest's whole content.
     pub doc: String,
+    /// SHA-256 of the raw bytes of every repo-relative file this hash's
+    /// computation actually depended on: the file itself, plus every
+    /// out-of-line module file recursively reached from it (see
+    /// [`inline_hashes_at`]). Used only to short-circuit `verify_inline`'s
+    /// re-parse: the parse is a pure function of exactly this content, so
+    /// identical bytes everywhere in this set guarantee an identical
+    /// `cfg_test`/`doc`, and a change anywhere in it is caught by falling
+    /// back to a real re-parse rather than by trusting this map's shape.
+    ///
+    /// `None` for a manifest saved before this field existed, or for a hash
+    /// computed by the pure-string [`inline_hashes`] (there is no
+    /// filesystem to hash against) — always treated as "unknown, must
+    /// parse", never as "unchanged", so an old manifest is never silently
+    /// exempted from the real check. Deliberately excluded from this type's
+    /// derived equality's *use* in `verify_inline` (only `cfg_test`/`doc`
+    /// are compared there): reformatting an out-of-line module changes its
+    /// bytes without changing its token-stream hash, and this field must
+    /// never turn that into a false positive.
+    #[serde(default)]
+    pub content_sha256: Option<BTreeMap<String, String>>,
 }
 
 /// Maps repo-relative paths to their hash at baseline time.
@@ -333,23 +353,33 @@ fn inline_hashes_in(source: &str, fs: Option<(&Path, &str)>) -> Result<InlineHas
         syn::parse_file(source).map_err(|e| FreezeError::Io(format!("parse source: {e}")))?;
 
     let mut cfg_test_digests = Vec::new();
-    let mut seen = HashSet::new();
-    match fs {
+    let mut guard = ModuleGuard::default();
+    let content_sha256 = match fs {
         Some((repo_root, rel)) => {
-            seen.insert(rel.to_string());
+            // The top-level file is the root of this traversal's declaration
+            // path, so it counts as an ancestor of everything it (directly
+            // or transitively) declares — a `mod x;` chain that loops back
+            // to it is exactly as cyclic as one that loops back to any other
+            // module on the path.
+            guard.stack.insert(rel.to_string());
+            guard
+                .content
+                .insert(rel.to_string(), sha256_bytes(source.as_bytes()));
             let loc = ModuleLoc::root(rel);
             collect_cfg_test(
                 Some((repo_root, &loc)),
                 &file.items,
                 &mut cfg_test_digests,
-                &mut seen,
+                &mut guard,
                 0,
             )?;
+            Some(std::mem::take(&mut guard.content))
         }
         None => {
-            collect_cfg_test(None, &file.items, &mut cfg_test_digests, &mut seen, 0)?;
+            collect_cfg_test(None, &file.items, &mut cfg_test_digests, &mut guard, 0)?;
+            None
         }
-    }
+    };
     cfg_test_digests.sort();
 
     let mut docs = String::new();
@@ -359,6 +389,7 @@ fn inline_hashes_in(source: &str, fs: Option<(&Path, &str)>) -> Result<InlineHas
     Ok(InlineHashes {
         cfg_test: sha256_bytes(cfg_test_digests.concat().as_bytes()),
         doc: sha256_bytes(docs.as_bytes()),
+        content_sha256,
     })
 }
 
@@ -543,6 +574,41 @@ fn resolve_mod_file(
     )))
 }
 
+/// Per-[`inline_hashes_in`] traversal state, threaded through every call
+/// that can resolve a `mod x;` declaration against the real filesystem.
+///
+/// A module reached twice within the SAME top-level traversal is not
+/// necessarily a cycle: an ordinary diamond — one test-support module
+/// declared from two different, non-cyclic parents — reaches the same file
+/// twice too, and is entirely legitimate Rust. What makes a cycle a cycle is
+/// a module reappearing among its OWN ancestors (the declaration path
+/// currently being resolved), not merely having been visited earlier and
+/// already finished. `stack` tracks exactly that ancestor path; `memo` and
+/// `content` are keyed independently and simply accumulate across the whole
+/// traversal, diamond or not.
+#[derive(Default)]
+struct ModuleGuard {
+    /// Repo-relative paths on the CURRENT declaration path, i.e. this
+    /// module's ancestors. A path reappearing here — not merely present in
+    /// `memo` — is a genuine cycle.
+    stack: HashSet<String>,
+    /// Every module file's already-fully-resolved hash, keyed by its own
+    /// path together with the exact location (`file_dir`/`children_dir`) it
+    /// was reached under. The location has to be part of the key, not just
+    /// the path: the same physical file reached under two different
+    /// declared names (via `#[path]`) resolves ITS OWN children
+    /// differently — see [`ModuleLoc::for_file`] — so a hash computed under
+    /// one location must never be reused for another. This is what makes a
+    /// diamond cheap, not merely correct: the shared module is parsed once,
+    /// not once per parent that declares it.
+    memo: BTreeMap<(String, String, String), String>,
+    /// Raw-byte SHA-256 of every file actually read during this traversal
+    /// (the top-level file plus every out-of-line module file reached),
+    /// keyed by repo-relative path. Folded into
+    /// [`InlineHashes::content_sha256`] by [`inline_hashes_in`].
+    content: BTreeMap<String, String>,
+}
+
 /// Hashes an out-of-line module file's entire token stream, plus — since
 /// everything inside it is already within a test-gated island regardless of
 /// its own attributes — every further module IT declares without a body,
@@ -553,15 +619,26 @@ fn hash_module_file(
     rel: &str,
     loc: &ModuleLoc,
     depth: usize,
-    seen: &mut HashSet<String>,
+    guard: &mut ModuleGuard,
 ) -> Result<String, FreezeError> {
+    let key = (
+        rel.to_string(),
+        loc.file_dir.clone(),
+        loc.children_dir.clone(),
+    );
+    if let Some(hash) = guard.memo.get(&key) {
+        // Already fully resolved via another, unrelated parent earlier in
+        // this same traversal — a diamond, not a cycle. Reuse it rather
+        // than reading and re-parsing the file a second time.
+        return Ok(hash.clone());
+    }
     if depth > MAX_MOD_DEPTH {
         return Err(FreezeError::Io(format!(
             "module nesting is more than {MAX_MOD_DEPTH} deep resolving {rel:?} — refusing to \
              recurse further"
         )));
     }
-    if !seen.insert(rel.to_string()) {
+    if !guard.stack.insert(rel.to_string()) {
         return Err(FreezeError::Io(format!(
             "cyclic module declaration involving {rel:?}"
         )));
@@ -571,10 +648,21 @@ fn hash_module_file(
     let text =
         std::fs::read_to_string(&path).map_err(|e| FreezeError::Io(format!("read {rel}: {e}")))?;
     let file = syn::parse_file(&text).map_err(|e| FreezeError::Io(format!("parse {rel}: {e}")))?;
+    guard
+        .content
+        .insert(rel.to_string(), sha256_bytes(text.as_bytes()));
 
     let mut parts = vec![file.to_token_stream().to_string()];
-    collect_declared_mods(&file.items, repo_root, loc, depth, seen, &mut parts)?;
-    Ok(sha256_bytes(parts.concat().as_bytes()))
+    let result = collect_declared_mods(&file.items, repo_root, loc, depth, guard, &mut parts);
+    // Popped whether this succeeded or not: on success it is no longer an
+    // ancestor of anything; on failure the whole traversal is about to
+    // abort anyway, so a stale stack entry cannot mislead anyone.
+    guard.stack.remove(rel);
+    result?;
+
+    let hash = sha256_bytes(parts.concat().as_bytes());
+    guard.memo.insert(key, hash.clone());
+    Ok(hash)
 }
 
 /// Inside an already test-gated island: walks every item looking for a
@@ -587,7 +675,7 @@ fn collect_declared_mods(
     repo_root: &Path,
     loc: &ModuleLoc,
     depth: usize,
-    seen: &mut HashSet<String>,
+    guard: &mut ModuleGuard,
     parts: &mut Vec<String>,
 ) -> Result<(), FreezeError> {
     for item in items {
@@ -596,7 +684,7 @@ fn collect_declared_mods(
             Some((_, inner)) => {
                 let path_attr = extract_path_attr(&m.attrs);
                 let child_loc = loc.for_inline(&m.ident.to_string(), path_attr.as_deref())?;
-                collect_declared_mods(inner, repo_root, &child_loc, depth, seen, parts)?;
+                collect_declared_mods(inner, repo_root, &child_loc, depth, guard, parts)?;
             }
             None => {
                 let name = m.ident.to_string();
@@ -608,7 +696,7 @@ fn collect_declared_mods(
                     &child_rel,
                     &child_loc,
                     depth + 1,
-                    seen,
+                    guard,
                 )?);
             }
         }
@@ -728,7 +816,7 @@ fn collect_cfg_test(
     fs: Option<(&Path, &ModuleLoc)>,
     items: &[syn::Item],
     out: &mut Vec<String>,
-    seen: &mut HashSet<String>,
+    guard: &mut ModuleGuard,
     depth: usize,
 ) -> Result<(), FreezeError> {
     for item in items {
@@ -752,7 +840,7 @@ fn collect_cfg_test(
                         &child_rel,
                         &child_loc,
                         depth + 1,
-                        seen,
+                        guard,
                     )?);
                     continue;
                 }
@@ -775,7 +863,7 @@ fn collect_cfg_test(
                     child_fs.as_ref().map(|(r, l)| (*r, l)),
                     inner,
                     out,
-                    seen,
+                    guard,
                     depth + 1,
                 )?;
             }
@@ -908,15 +996,68 @@ fn collect_item_docs(items: &[syn::Item], out: &mut String) {
     }
 }
 
+/// Whether every file `want.content_sha256` records is still byte-for-byte
+/// identical to baseline, which makes re-parsing to recompute
+/// `want.cfg_test`/`want.doc` redundant: that computation is a pure function
+/// of exactly this content (see [`inline_hashes_in`]), so unchanged bytes
+/// everywhere in the set guarantee an unchanged result.
+///
+/// Fails closed on anything ambiguous, treating it as "cannot skip" rather
+/// than "unchanged" — a missing field (`None`, from a manifest written
+/// before it existed, or from a hash with no filesystem behind it), a
+/// missing or unreadable file, or a symlink anywhere along a recorded path.
+/// A symlinked path is rejected outright, exactly as [`verify`] treats one
+/// for frozen files: at least as suspicious as a deleted file, never
+/// something to read through and compare by content, since identical bytes
+/// reached via a link do not mean the same thing as identical bytes reached
+/// directly (see [`symlink_component`]'s doc comment). This function is
+/// purely a speed short-circuit — returning `false` here never causes a
+/// missed change, only a slower, fully-correct re-parse via
+/// [`inline_hashes_at`], which is exactly the pre-existing check.
+fn content_unchanged(repo_root: &Path, want: &InlineHashes) -> bool {
+    let Some(content) = &want.content_sha256 else {
+        return false;
+    };
+    for (rel, want_hash) in content {
+        match symlink_component(repo_root, rel) {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return false,
+        }
+        let Ok(path) = safe_join(repo_root, rel) else {
+            return false;
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) if &sha256_bytes(&bytes) == want_hash => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Reports which in-scope source files' inline tests differ from baseline.
 ///
 /// A deleted or unreadable file counts as changed: its tests are certainly not
 /// what they were.
+///
+/// Gate 5's dominant cost used to be a full `syn::parse_file` over every
+/// in-scope file on every eval, whether or not it changed. Most evals change
+/// none of them, so [`content_unchanged`] first checks raw bytes — a cost
+/// linear in file size but with no parsing at all — and only falls through
+/// to the real parse-based check when that cannot prove nothing changed.
+/// This changes nothing about what counts as "changed": the raw-byte check
+/// is content-only (it never consults git, so a gitignored in-scope file is
+/// exactly as visible to it as to the real check — see
+/// [`crate::discover::in_scope_sources`]), and comparing only `cfg_test`
+/// and `doc` below — not `content_sha256` — on the slow path is what the
+/// gate always compared, before this field existed.
 pub fn verify_inline(repo_root: &Path, m: &Manifest) -> Result<Vec<String>, FreezeError> {
     let mut changed = Vec::new();
     for (rel, want) in &m.inline {
+        if content_unchanged(repo_root, want) {
+            continue;
+        }
         match inline_hashes_at(repo_root, rel) {
-            Ok(got) if &got == want => {}
+            Ok(got) if got.cfg_test == want.cfg_test && got.doc == want.doc => {}
             // Anything else — a deleted or symlinked file, one that no
             // longer parses (an unparseable file is a syntax error the build
             // gate, which runs after this one, will report properly; here it
@@ -1602,6 +1743,76 @@ extern "C" {
                 "weakening the doctest touching {needle:?} must change the doc hash"
             );
         }
+    }
+
+    // A genuine cycle: `mod a;` (the top-level file itself) declares
+    // `mod b;`, whose file declares `mod a;` right back — via `#[path]`, so
+    // the identifier need not literally be "lib". This must still be
+    // refused, not silently accepted now that revisiting a module is no
+    // longer treated as cyclic on its own.
+    #[test]
+    fn a_genuine_cycle_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "#[cfg(test)]\nmod b;\n").unwrap();
+        fs::write(root.join("src/b.rs"), "#[path = \"lib.rs\"]\nmod back;\n").unwrap();
+        match inline_hashes_at(root, "src/lib.rs") {
+            Err(FreezeError::Io(msg)) => assert!(msg.contains("cyclic"), "{msg}"),
+            other => panic!("expected a cyclic-declaration error, got {other:?}"),
+        }
+    }
+
+    // Finding 3: an ordinary diamond — the same test-support module declared
+    // (without a body) from two different, non-cyclic parents — is
+    // legitimate Rust and must hash successfully, not be misreported as a
+    // cyclic module declaration merely because the traversal reaches it
+    // twice.
+    #[test]
+    fn a_diamond_shaped_module_declaration_is_not_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        // lib.rs declares two test-gated modules, `a` and `b`, each of which
+        // declares the SAME shared out-of-line module `shared` — reached by
+        // two different, unrelated parents, not by any cycle.
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(test)]\nmod a;\n#[cfg(test)]\nmod b;\n",
+        )
+        .unwrap();
+        // a.rs and b.rs both live directly under src/, the same directory as
+        // shared.rs, so `#[path]` needs no `..` — it resolves against the
+        // declaring file's own directory.
+        fs::write(
+            root.join("src/a.rs"),
+            "#[path = \"shared.rs\"]\nmod shared;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/b.rs"),
+            "#[path = \"shared.rs\"]\nmod shared;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/shared.rs"),
+            "#[test]\nfn shared_check() { assert_eq!(1 + 1, 2); }\n",
+        )
+        .unwrap();
+
+        let baseline =
+            inline_hashes_at(root, "src/lib.rs").expect("a diamond must not error as a cycle");
+
+        // And the diamond must still hash real content, not silently
+        // collapse to an empty marker: weakening the shared assertion must
+        // change the digest.
+        fs::write(
+            root.join("src/shared.rs"),
+            "#[test]\nfn shared_check() { assert!(true); }\n",
+        )
+        .unwrap();
+        let weakened = inline_hashes_at(root, "src/lib.rs").unwrap();
+        assert_ne!(baseline.cfg_test, weakened.cfg_test);
     }
 
     // I8: `#[doc = include_str!("...")]` is an `Expr::Macro`, which the old
