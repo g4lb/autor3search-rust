@@ -114,6 +114,17 @@ faster. The only harness output that stays inside your repo is
 `results.tsv` (a human-readable log, not part of the metric) and `run.log`
 (subprocess transcripts) — both gitignored by `init`.
 
+**Take "not part of the metric" literally.** `results.tsv` sits in the
+repository, is gitignored, and is skipped by the scope gate, so the agent can
+append whatever rows it likes and nothing will stop it or notice. That does
+not let a bad change through — verdicts come from `eval`, which gates the real
+code — but it does mean `report`'s cumulative figure is only as honest as the
+agent that produced the rows behind it. The authoritative record of what was
+actually kept is the run branch's git history, and the harness's own state
+lives outside the repository where the agent cannot reach it. `program.md`
+tells the agent not to touch `results.tsv`; that is an instruction, not a
+control, and it is the only cheat in this section not closed by code.
+
 There is a fourth kind of test this table doesn't capture: a
 `#[cfg(test)] mod tests` block or a doctest **inside** a `src/**` file you
 are otherwise allowed to edit. Those cannot be frozen as a whole file
@@ -555,11 +566,15 @@ None of these is cosmetic, and none of them is going to change soon.
   builds `--release`, because that is what the benchmarks run as. Gate 8 then
   runs `cargo test`, which builds the same graph again in `debug` — deliberately,
   so `debug_assert!` and arithmetic-overflow checks stay armed, but at real
-  cost: measured at 7.5 s on the bundled demo crate, whose entire dependency
-  graph is criterion and its transitives. On a heavier crate this dominates an
-  experiment's wall time more than the benchmark rounds do. The Go original's
-  reasoning that per-round measurement overhead dominates does not carry over
-  here, and this is the reason.
+  cost — but a **cold** one, paid once. Neither `baseline` nor `eval` ever
+  cleans the target directory, so only the first eval of a run pays for the
+  debug profile from scratch: measured at 8.1 s cold on the bundled demo
+  crate, against 1.2 s warm. In steady state — every eval after the first,
+  which is essentially all of an overnight run — the two compiles together
+  cost about 4 s while the benchmark rounds cost 70 s or more by design, so
+  measurement time dominates by better than an order of magnitude. The double
+  compile only becomes the larger cost on a crate whose dependency graph is
+  unusually large *and* where every experiment invalidates the debug profile.
 
 - **No allocation metrics at all.** Go gets `B/op` and `allocs/op` free from
   `-benchmem`. Criterion measures time only, and counting allocations would

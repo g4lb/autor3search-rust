@@ -1,7 +1,6 @@
 /target
 /autor3search-rust
 /testdata/demo/target
-/testdata/demo/Cargo.lock
 
 # The harness's own run artifacts, from dogfooding it on this repository.
 .autor3search/
