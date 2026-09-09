@@ -10,7 +10,12 @@ authors = ["Gal Be <galevgi@gmail.com>"]
 readme = "README.md"
 keywords = ["benchmark", "performance", "optimization", "criterion", "agent"]
 categories = ["development-tools", "command-line-utilities"]
-exclude = ["docs/", ".superpowers/", "testdata/demo/"]
+# docs/ and .superpowers/ are development material. tests/ and testdata/demo
+# are left out together: cargo always drops a nested package like the demo
+# crate, and the integration tests need it, so shipping them would publish a
+# suite that cannot pass. testdata/criterion stays — src/bench.rs parses it.
+# The full suite lives in the git repository.
+exclude = ["docs/", ".superpowers/", "testdata/demo/", "tests/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

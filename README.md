@@ -16,18 +16,23 @@ where the metric comes from criterion, where the tests that judge a change
 live inside the files being changed, and where **correctness is not
 optional**.
 
-> **Status: early but working.** This release is proven by its own test suite — 240+
-> tests, including end-to-end tests that drive `eval` to a real `KEEP` and a
-> real `DISCARD` against the bundled demo crate — and by one real measured
-> run against that crate, recorded in full in
+> **Status: early but working.** This release is proven by its own test
+> suite — 275+ tests, including end-to-end tests that drive `eval` to a real
+> `KEEP` and a real `DISCARD` against the bundled demo crate — by one real
+> measured run against that crate, recorded in full in
 > [the case study](docs/case-study.md): a quadratic `String` rebuild replaced
 > with `String::with_capacity` + `push`, measured at **−13.57 %**
-> (44,702 ns → 38,636 ns, `p ≈ 1.1 × 10⁻⁵`), `KEEP`. It has **not** yet been
-> run against a third-party crate from crates.io with an agent driving
-> `program.md` end to end — see
-> [Validation status](#validation-status-stated-exactly) before you point it
-> at something you care about. Every number in this README and in the case
-> study is a real measurement, never an illustration.
+> (44,702 ns → 38,636 ns, `p ≈ 1.1 × 10⁻⁵`), `KEEP` — and by one run against
+> a third-party crate from crates.io, `unicode-segmentation` v1.13.3, driven
+> end to end by an agent following `program.md`, written up in
+> [the third-party validation report](docs/thirdparty-validation.md): four
+> experiments, two `KEEP`s and two honest `DISCARD`s, the best of them
+> **−90.53 %** on one benchmark, **2.33×** cumulative. That run found three
+> real defects in this tool, all since fixed and covered by regression
+> tests — see [Validation status](#validation-status-stated-exactly) for
+> what that does and does not establish. Every number in this README, in the
+> case study and in that report is a real measurement, never an
+> illustration.
 >
 > What version you get, and what changed in it, is on the
 > [releases page](https://github.com/g4lb/autor3search-rust/releases) — this
@@ -249,7 +254,7 @@ special: clear any pending stop and point the agent back at `program.md`.
 | `init` | Scans the repo with `cargo metadata` and criterion `--list`, and writes `.autor3search/config.yaml` + `program.md`. Refuses to overwrite an existing config without `--force`. |
 | `doctor` | Checks whether this machine can measure reliably (CPU frequency scaling, thermal throttling risk, load average, disk space, on-battery, `CARGO_INCREMENTAL`, a `[profile.bench]` override, a nightly default toolchain) and prints its findings. Load average and disk space are unix-only — there is no portable equivalent — so on Windows it warns you about less. Informational — always exits 0. |
 | `baseline --tag <tag>` | Creates the run branch `autor3search-rust/<tag>`, freezes every in-scope `tests/**`/`benches/**` file, hashes every in-scope `src/**` file's inline tests and doctests, hashes every locked file present on disk, and pins a detached worktree at the baseline commit. Refuses a dirty tree and a reused tag. |
-| `profile` | Runs the declared benchmarks under criterion's `--profile-time` with [samply](https://github.com/mstange/samply) attached, and prints the top self-time symbols — real sampling-profiler data on where time actually goes, rather than an agent guessing from reading source. When samply is not installed, prints how to install it (`cargo install samply`) and exits 0 rather than failing the run. |
+| `profile` | Runs the declared benchmarks under criterion's `--profile-time` with [samply](https://github.com/mstange/samply) attached, and prints the top self-time symbols — real sampling-profiler data on where time actually goes, rather than an agent guessing from reading source. When samply is not installed, prints how to install it (`cargo install samply`) and exits 0 rather than failing the run. Symbol names come from samply's `--unstable-presymbolicate` sidecar; a samply too old to have that flag still profiles, but its frames stay as raw addresses and the report says so. |
 | `eval` | Runs one experiment: gates (scope, locked files, config integrity, restore, inline-test check, frozen-set check, build, test, worktree integrity), measures the candidate against the pinned baseline worktree, scores it, appends a `results.tsv` row, exits `0`/`1`/`2`/`3` for KEEP/DISCARD/FAIL/CRASH, and on `KEEP` re-points the pinned worktree at the candidate's commit so the next `eval` measures against it (see [Scoring](#scoring)). |
 | `status` | Prints where a run is: run branch and whether it is checked out, the frozen baseline commit and the advancing measurement commit, the pinned worktree, how many experiments have run and with what verdicts, and whether a stop is pending. Read-only. Accepts `--tag <tag>` so it works from any branch. |
 | `stop` | Asks the agent to end the run after the experiment it is running: writes a request `eval` reports back as `stop_requested`. `--clear` cancels a pending request; `--force` additionally signals the running `eval` to abandon the current experiment and reports what state that leaves the repository in. Accepts `--tag <tag>`. |
@@ -408,7 +413,7 @@ An agent optimizing your code can "win" by cheating. Each route is closed:
 |---|---|
 | Weaken or delete a `tests/**`/`benches/**` file | hashed at baseline and **restored** before every run — edits are erased, not argued about |
 | Weaken an inline `#[cfg(test)]` assertion | hashed at baseline over its parsed token text; any change is a hard `FAIL(inline_test_modified)` — refused, not restored, since restoring the whole file would erase the agent's real edit too |
-| Weaken a doctest | same: doctest text is hashed at baseline, and any change is `FAIL(inline_test_modified)` |
+| Weaken a doctest | same, over the fenced code only: both the doctest's body and its fence — ` ```ignore `, ` ```no_run ` and ` ```text ` each switch a doctest off without touching a line of it — are hashed, so any change to the test is `FAIL(inline_test_modified)`. Prose around it is yours to rewrite |
 | Delete the work a benchmark measures | the frozen tests still run and still assert the real behavior |
 | Add an easier benchmark | any `tests/**`/`benches/**` file absent from the frozen manifest is rejected |
 | Replace a frozen test file with a symlink to a file outside the repo | freezing refuses to snapshot a symlinked test file, and restoring refuses to write through one that appears later — both fail loudly instead of writing through the link |
@@ -630,20 +635,47 @@ None of these is cosmetic, and none of them is going to change soon.
 
 ### Validation status, stated exactly
 
-This tool is proven by its own test suite — 240+ tests, including
-end-to-end tests that drive `eval` to a real `KEEP` and a real `DISCARD`
-against the bundled `testdata/demo` crate — and by the one real measured run
-recorded in [the case study](docs/case-study.md) and in the
-[worked example](#worked-example) above. It has **not** been run against a
-third-party crate from crates.io, with an agent driving `program.md`
-end to end, as part of this release. The Go original's README says
-"Validated against three real libraries" because it was; this README does
-not make a comparable claim, because it would not be true. State what has
-been validated and what has not, plainly: one real `KEEP` on one small,
-purpose-built benchmark proves the pipeline works end to end and produces a
-real, checkable number. It is not evidence that the tool generalizes to a
-large, unfamiliar codebase with many benchmarks running for hours
-unattended — that run has not happened yet.
+Three things back this tool, and it is worth being precise about what each
+one does and does not establish.
+
+**Its own test suite** — 275+ tests, including end-to-end tests that drive
+`eval` to a real `KEEP` and a real `DISCARD` against the bundled
+`testdata/demo` crate.
+
+**One real measured run against that demo crate**, recorded in
+[the case study](docs/case-study.md) and in the
+[worked example](#worked-example) above. That proves the pipeline works end
+to end and produces a real, checkable number — on a small benchmark built
+for the purpose.
+
+**One run against a third-party crate from crates.io**:
+`unicode-segmentation` v1.13.3, with an agent driving `program.md` end to
+end against a codebase this tool was not designed around. The full report,
+including the two hypotheses that did not pay off, is in
+[the third-party validation report](docs/thirdparty-validation.md). Four
+experiments, two `KEEP`s and two honest `DISCARD`s; the largest win was
+**−90.53 %** on one benchmark (**−55.19 %** geometric mean for that
+experiment), and `report`'s cumulative **2.33×** is exactly the product of
+the two kept scores. The frozen-test guarantee was attacked on purpose
+during that run — a frozen test's assertions weakened and the code it
+guards broken in the same commit — and it held: `eval` reported
+`FAIL(tests_failed)` against the *original* assertions and the file was
+restored on disk.
+
+That run also found three real defects in this tool. `init` could not see
+criterion 0.3.x/0.4.x benchmarks at all, reporting "no benchmarks found" on
+crates whose benchmarks work perfectly well. `profile` crashed against the
+version of samply `cargo install samply` gives you today. And the
+doc-comment gate fired on plain prose, so an agent could not document code
+it had just written. All three are fixed and carry regression tests; the
+fixes were verified against the same crates that exposed them.
+
+Finding three defects on first contact with an unfamiliar codebase is the
+honest headline. The Go original's README says "Validated against three
+real libraries" because it was; this one has been validated against one —
+and one small, dependency-free, already well-tuned library at that. It is
+still not evidence that the tool generalizes to a large codebase with many
+benchmarks running for hours unattended. That run has not happened.
 
 Two narrower gaps, named rather than glossed over:
 
