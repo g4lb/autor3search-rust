@@ -1,0 +1,46 @@
+[package]
+name = "autor3search-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Autonomous AI-driven performance optimization for any Rust repository."
+repository = "https://github.com/g4lb/autor3search-rust"
+authors = ["Gal Be <galevgi@gmail.com>"]
+readme = "README.md"
+keywords = ["benchmark", "performance", "optimization", "criterion", "agent"]
+categories = ["development-tools", "command-line-utilities"]
+exclude = ["docs/", ".superpowers/", "testdata/demo/"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+dirs = "5"
+glob = "0.3"
+syn = { version = "2", features = ["full", "parsing", "printing", "extra-traits", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[lib]
+name = "autor3search"
+path = "src/lib.rs"
+
+[[bin]]
+name = "autor3search-rust"
+path = "src/bin/autor3search-rust/main.rs"
