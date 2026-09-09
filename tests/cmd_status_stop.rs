@@ -30,6 +30,14 @@ fn status_reports_the_run_and_writes_nothing() {
             "status must mention {expected:?}:\n{text}"
         );
     }
+    // The snapshot skips directories and `target/`, so guard against it
+    // silently degrading into a comparison of two empty lists — a test that
+    // cannot fail is worse than no test.
+    assert!(
+        before.len() > 10,
+        "tree_snapshot should see the repo's real files, saw {}",
+        before.len()
+    );
     // Checking on a run must not be able to change it.
     assert_eq!(common::tree_snapshot(repo.path()), before);
 }

@@ -107,6 +107,23 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else { continue };
+        let name = entry.file_name();
+        if meta.is_dir() {
+            // `target/` is build output. Cargo touches it from whatever build
+            // happens to be running, so including it makes this snapshot a
+            // measure of the machine rather than of the command under test.
+            if name == "target" {
+                continue;
+            }
+            // Recurse, but do not RECORD the directory itself. Windows updates
+            // directory mtimes lazily, so `.git`, `.git\hooks` and their
+            // siblings can appear to change when nothing inside them did —
+            // which failed this test on Windows CI while `status` had in fact
+            // created, removed and modified nothing. Files are what "wrote
+            // something" actually means.
+            walk(root, &path, out);
+            continue;
+        }
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -119,9 +136,6 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         out.push((rel, mtime));
-        if meta.is_dir() {
-            walk(root, &path, out);
-        }
     }
 }
 
