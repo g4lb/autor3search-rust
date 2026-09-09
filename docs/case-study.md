@@ -129,8 +129,9 @@ largest wins:
 **This run happened to reach KEEP.** It is reported exactly as it came out —
 this project's standard is to report a DISCARD just as plainly if that had
 been the result, not to retry until the tool produces the answer that looks
-best. See the full raw output, including `doctor`, `baseline`, and `report`,
-in `task-20-report.md` alongside the implementation record.
+best. Every command's output above (`doctor`, `baseline`, `eval`, `report`)
+is copied verbatim from the one run this case study describes; none of it
+was edited or re-run to improve on the first result.
 
 ## Housekeeping and disk
 
@@ -141,11 +142,18 @@ the candidate and the frozen baseline worktree, each with their own
 artifacts (`target/`) and the entire `AUTOR3SEARCH_RUST_STATE_HOME` scratch
 directory (including the baseline worktree's own `target/` and criterion's
 per-round sample data) were deleted immediately after the numbers above were
-extracted, returning the machine to its starting ~2.1 GiB free. Running the
-full `--ignored` end-to-end suite in parallel with anything else on a
-similarly tight machine is not safe — see the note under
-[Validation status](../README.md#limitations) in the README about the
-~1.7 GiB one interrupted test run was independently observed to consume.
+extracted, returning the machine to its starting ~2.1 GiB free.
+
+This project's own test suite has a known disk-hygiene gap, and this run's
+own verification stepped in it: `tests/pipeline_gates.rs` spins up a fresh
+temporary git repository (with its own `target/`) per test, and an
+interrupted run does not clean those up. Killing an in-progress
+`cargo test --all-targets` invocation during this task (to keep free space
+comfortably above the ~800 MiB floor treated as a hard stop) left two such
+orphaned directories under the OS temp directory, totaling roughly 450 MB,
+which had to be found and removed by hand before the freed space showed up
+in `df`. Running the full `--ignored` end-to-end suite in parallel with
+anything else on a similarly tight machine is not safe for the same reason.
 
 ## Bugs the review process caught
 
@@ -242,9 +250,10 @@ against this same bundled demo crate — is the full extent of what has been
 validated as of this writing. It has **not** been run against a third-party
 crate from crates.io with an agent driving `program.md` end to end; that is
 explicitly out of scope for this release (see
-[Validation status](../README.md#limitations) in the README) rather than
-silently skipped. A single `KEEP` on one small benchmark is evidence that the
-pipeline works end to end on real code and produces a real, checkable
-number — not evidence that the tool generalizes to a large, unfamiliar
+[Validation status, stated exactly](../README.md#validation-status-stated-exactly)
+in the README) rather than silently skipped. A single `KEEP` on one small
+benchmark is evidence that the pipeline works end to end on real code and
+produces a real, checkable number — not evidence that the tool generalizes
+to a large, unfamiliar
 codebase with many benchmarks, nor a substitute for that run once the
 machine and the time exist to do it properly.
