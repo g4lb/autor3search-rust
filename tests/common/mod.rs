@@ -164,6 +164,14 @@ impl TestRepo {
         Self::git(&root, &["init", "-q", "-b", "main"]);
         Self::git(&root, &["config", "user.name", "Test"]);
         Self::git(&root, &["config", "user.email", "test@example.com"]);
+        // Windows' default `core.autocrlf=true` would let git rewrite these
+        // fixtures' checked-out bytes on checkout, so a test comparing exact
+        // file content would be comparing against git's rewrite rather than
+        // what the test itself wrote. A measurement harness wants
+        // deterministic bytes from its own fixtures regardless of the
+        // host's global git config.
+        Self::git(&root, &["config", "core.autocrlf", "false"]);
+        Self::git(&root, &["config", "core.eol", "lf"]);
         (dir, root, tempfile::tempdir().unwrap())
     }
 

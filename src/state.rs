@@ -264,13 +264,16 @@ pub static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// file plus a recycled pid could eventually make `stop --force` signal a
 /// process that has nothing to do with this run.
 ///
-/// On non-unix platforms there is no such lock implemented here (see the
-/// module's `#[cfg(not(unix))]` fallback): the pid is still written on claim
-/// and removed on every exit path this process reaches normally, but a
-/// process that dies without unwinding leaves a stale file with no way to
-/// tell it apart from a live one by inspecting the file alone. This is a
-/// real, disclosed gap on that platform, not a guarantee — see the Task 19
-/// report.
+/// On Windows the claim rests on the same guarantee, expressed through file
+/// sharing instead of `flock`: the pid file is opened with a share mode
+/// that denies write access to every other opener
+/// (`std::os::windows::fs::OpenOptionsExt::share_mode`), and the OS enforces
+/// that atomically at open time for as long as the handle stays open.
+/// Windows closes the handle the instant this process exits **by any
+/// means**, including a hard `TerminateProcess` — exactly like the unix
+/// descriptor case above — so [`eval_running`] gets the identical property
+/// on both platforms: liveness is proven by who can still be denied write
+/// access to the file, never by the pid number it happens to contain.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct EvalClaim {
@@ -335,30 +338,96 @@ pub fn claim_eval(state_dir: &Path) -> Result<EvalClaim, String> {
     Ok(EvalClaim { file, path })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 #[derive(Debug)]
 pub struct EvalClaim {
+    /// `Some` for the claim's whole lifetime; taken and closed explicitly in
+    /// `Drop`, before the file is removed — Windows refuses to delete a file
+    /// that is still open under a share mode that denied `FILE_SHARE_DELETE`
+    /// (which this claim, like the exclusive write access it denies
+    /// everyone else, never requests), so the handle must close first.
+    file: Option<std::fs::File>,
     path: PathBuf,
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl Drop for EvalClaim {
     fn drop(&mut self) {
+        drop(self.file.take());
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-/// See [`EvalClaim`]'s doc comment: on this platform the pid is recorded
-/// with no lock behind it, so a process that dies without unwinding leaves
-/// a file [`eval_running`] cannot tell from a live one.
-#[cfg(not(unix))]
+/// The raw value of `FILE_SHARE_READ`, spelled out as a plain constant so
+/// this module needs neither a new dependency nor new `windows-sys`
+/// features: `std`'s `OpenOptionsExt::share_mode` just takes the raw flag.
+///
+/// A live claim shares exactly this much of the pid file: it lets any other
+/// open request READ it (so [`eval_pid`] always succeeds, live claim or
+/// not — the same as a plain unix read is never blocked by another
+/// process's `flock`), while denying WRITE access to everyone else. Both a
+/// second [`claim_eval`] and an [`eval_running`] liveness probe request
+/// write access, so both fail with a sharing violation exactly when, and
+/// only when, a live claim already holds the file — the Windows analogue of
+/// `flock(LOCK_EX)` losing to an existing exclusive holder.
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+/// The raw Windows error code `CreateFile` returns when the requested
+/// access conflicts with another open handle's share mode.
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+#[cfg(windows)]
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+}
+
+/// Claims this run's `eval` slot for the current process. Fails if another
+/// live process already holds the claim — two concurrent `eval`s against
+/// the same run would fight over the same pinned worktree — naming the
+/// incumbent pid rather than silently proceeding.
+///
+/// Unlike the unix path above, there is no separate "open, then lock" step:
+/// requesting write access with a share mode that denies write access to
+/// everyone else is checked atomically by the OS at open time, so if
+/// another live claim already holds the file this call never touches its
+/// content at all — no window where a competing claim's pid could be
+/// truncated before we know we are the only holder.
+#[cfg(windows)]
 pub fn claim_eval(state_dir: &Path) -> Result<EvalClaim, String> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
     std::fs::create_dir_all(state_dir)
         .map_err(|e| format!("create {}: {e}", state_dir.display()))?;
     let path = state_dir.join(EVAL_PID_FILE);
-    std::fs::write(&path, format!("{}\n", std::process::id()))
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+        .map_err(|e| {
+            if is_sharing_violation(&e) {
+                let existing = std::fs::read_to_string(&path).unwrap_or_default();
+                format!(
+                    "another autor3search-rust eval (pid {}) is already running for this run — two \
+                     concurrent evals would fight over the same pinned worktree",
+                    existing.trim()
+                )
+            } else {
+                format!("open {}: {e}", path.display())
+            }
+        })?;
+    writeln!(file, "{}", std::process::id())
         .map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(EvalClaim { path })
+    file.flush()
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(EvalClaim {
+        file: Some(file),
+        path,
+    })
 }
 
 /// The pid recorded for this run's in-flight `eval`, if any. Does not check
@@ -420,12 +489,41 @@ pub fn eval_running(state_dir: &Path) -> Result<Option<u32>, String> {
     }
 }
 
-/// No lock-based liveness check is implemented on this platform (see
-/// [`EvalClaim`]): this reports the recorded pid as-is, whether or not the
-/// process it names is still the one that wrote it.
-#[cfg(not(unix))]
+/// The pid of the run's in-flight `eval`, when a LIVE process still holds
+/// the claim — distinguishing that from a pid file left behind by one that
+/// died without releasing it (a `TerminateProcess`, a crash).
+///
+/// The Windows analogue of the unix shared-lock probe above: try to open
+/// the same file requesting the write access an exclusive claim needs.
+/// Succeeding means nobody's share mode is denying that access, so the
+/// file — if present at all — is a leftover; failing with a sharing
+/// violation means a live claim's share mode IS denying it, so the pid is
+/// live. Any other failure (the file vanishing between the two checks, a
+/// permissions problem) is not proof of anything either way, so this fails
+/// safe and reports "not running" rather than a pid `stop --force` would
+/// then signal — liveness must be demonstrated, never assumed.
+#[cfg(windows)]
 pub fn eval_running(state_dir: &Path) -> Result<Option<u32>, String> {
-    Ok(eval_pid(state_dir))
+    use std::os::windows::fs::OpenOptionsExt;
+    let path = state_dir.join(EVAL_PID_FILE);
+    let Some(pid) = eval_pid(state_dir) else {
+        return Ok(None);
+    };
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+    {
+        Ok(file) => {
+            // Nobody's share mode denied us write access, so nobody holds
+            // the claim: this pid file is a leftover, not a live one.
+            drop(file);
+            Ok(None)
+        }
+        Err(e) if is_sharing_violation(&e) => Ok(Some(pid)),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]

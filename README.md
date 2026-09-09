@@ -205,10 +205,21 @@ genuinely wedged process, not the designed path — `--force` cannot clean it
 up, and you would need to kill it by hand. This is a smaller gap than it
 looks: an external `SIGKILL` aimed at `eval`'s own pid would not reach a
 wedged benchmark grandchild in a separate process group either, so
-escalating the signal buys less than it appears to. **The Windows path
-(`OpenProcess`/`TerminateProcess`) is compiled by CI on `windows-latest`, but
-never actually executed there, and has not been verified on real Windows
-hardware either** — see [Validation status](#validation-status-stated-exactly).
+escalating the signal buys less than it appears to.
+
+On Windows, the claim a live `eval` holds on its `eval.pid` file is a real,
+OS-enforced guarantee too — an exclusive file-sharing handle
+(`OpenOptionsExt::share_mode`) in place of unix's `flock`, released the
+instant the process exits by any means. `--force` there still ends the
+process outright with `OpenProcess`/`TerminateProcess` rather than a signal
+it can catch mid-benchmark, so it never gets the graceful path unix does.
+CI now runs this crate's test suite on Windows, but the one test that
+drives a real `stop --force` against a real running `eval`
+(`stop_force_aborts_an_in_flight_eval_and_writes_no_results_row`) is
+`#[ignore]`d there as everywhere else, and nobody has watched this path on
+physical or interactively-used Windows hardware — see
+[Validation status](#validation-status-stated-exactly) for exactly what CI
+does and does not exercise.
 
 **Ctrl+C.** Interrupting the agent works too. `eval` handles the signal
 rather than dying under it, which matters more than it sounds: criterion
@@ -625,18 +636,25 @@ Two narrower gaps, named rather than glossed over:
   [Watching a run, and stopping it](#watching-a-run-and-stopping-it) above
   for the full explanation and why the residual gap is smaller than it
   looks.
-- **The Windows `stop --force` path is compiled by CI but never executed by
-  it, and is unverified on real Windows hardware.** CI builds the full test
-  suite on `windows-latest`, so the `OpenProcess`/`TerminateProcess` code
-  compiles there — but the only test that calls into it
-  (`stop_force_aborts_an_in_flight_eval_and_writes_no_results_row`) is
-  `#[ignore]`d, because it runs a real, slow benchmark, and CI never passes
-  `--ignored`. So CI never actually executes this path, on any platform, let
-  alone verifies it on Windows specifically. Adding an `--ignored` CI job is
-  not the fix: each ignored test does a full release build and would make CI
-  unusably slow. Nor has anyone watched this path work against a real,
-  long-running benchmark on a physical or interactively-used Windows
-  machine, as part of this release.
+- **CI now runs this crate's test suite on Windows, but four
+  `#[ignore]`d end-to-end tests still never execute on any platform, and
+  nobody has used this on physical or interactively-used Windows
+  hardware.** Until recently the Windows CI job only compiled and linted;
+  it now runs `cargo test` there too, which is what caught (and this
+  release fixed) three Windows-only failures, including one in
+  `EvalClaim`'s own liveness check — Windows now gets the same
+  lock-based guarantee unix does (an exclusive file-sharing handle in
+  place of `flock`), verified by the same platform-agnostic unit tests on
+  both. What CI still does not run anywhere, Windows included, is the four
+  tests marked `#[ignore]` because they drive a real, slow benchmark to a
+  real `KEEP`/`DISCARD`/abort — among them
+  `stop_force_aborts_an_in_flight_eval_and_writes_no_results_row`, the one
+  test that exercises a real `stop --force` against a real running `eval`.
+  CI never passes `--ignored`, on any platform, so that path — and
+  `OpenProcess`/`TerminateProcess` termination specifically on Windows —
+  is exercised by unit tests only, never by an actual `eval` process
+  there. Adding an `--ignored` CI job is not the fix: each ignored test
+  does a full release build and would make CI unusably slow.
 
 ## Repos with no benchmarks
 
