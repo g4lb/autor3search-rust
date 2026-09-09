@@ -63,7 +63,7 @@ touched the real cache.
 ```
 
 The disk-space warning was not a false alarm for this machine (see
-[Housekeeping](#housekeeping) below) — `doctor` was right to flag it, and the
+[Housekeeping and disk](#housekeeping-and-disk) below) — `doctor` was right to flag it, and the
 run was watched closely as a result.
 
 ## The change
