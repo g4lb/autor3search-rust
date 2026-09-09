@@ -102,6 +102,36 @@ pub fn eval(
     let changed = gitx::changed_since(&o.root, &o.baseline.commit)?;
     let matcher = scope::Matcher::new(&o.cfg.scope);
     for rel in &changed {
+        // A symlink — the changed path itself, or any component beneath the
+        // repository root on the way to it — defeats both checks below by
+        // construction: `git status` reports the link (e.g. `.cargo`, or a
+        // workspace-member directory) as one atomic entry, so neither
+        // `locked_file`'s basename match nor the scope `Matcher`'s glob ever
+        // see the real, locked path (`.cargo/config.toml`) that the link
+        // actually resolves to when cargo — which does follow symlinks —
+        // reads it at build time. The harness cannot reason about what is
+        // behind a link it hasn't been told to trust, so it declines rather
+        // than guessing. `freeze::symlink_component` is the same check
+        // `freeze.rs` already applies to frozen test files, including the
+        // deliberate exception for the repository root itself (a repo
+        // legitimately reached through a symlinked ancestor, e.g. macOS's
+        // `/tmp`, is not tampering).
+        if let Some(link) = freeze::symlink_component(&o.root, rel).map_err(|e| e.to_string())? {
+            return Ok((
+                verdict::gate(
+                    Status::Fail,
+                    Reason::ScopeViolation,
+                    format!(
+                        "{rel}: {link} is a symlink; refusing to match a path reached through a \
+                         symlink against locked files or scope, because the link can make a \
+                         locked file (or a path outside the repository) look like an ordinary, \
+                         differently-named change. Replace {link} with a real file or directory \
+                         and rerun."
+                    ),
+                ),
+                None,
+            ));
+        }
         if let Some(reason) = scope::locked_file(rel) {
             return Ok((
                 verdict::gate(
