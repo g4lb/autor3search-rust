@@ -4,14 +4,13 @@ use std::process::Command;
 mod common;
 use common::TestRepo;
 
+// `common::run_cli` shares a `CARGO_TARGET_DIR` across fixtures for every
+// command except `eval` — see its doc comment. `baseline` never builds
+// anything (it only freezes files and adds a git worktree), so this file
+// just delegates to it rather than keeping its own copy of the same
+// `Command` construction.
 fn run(repo: &TestRepo, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_autor3search-rust"))
-        .args(args)
-        .arg("-C")
-        .arg(repo.path())
-        .env("AUTOR3SEARCH_RUST_STATE_HOME", repo.state_home())
-        .output()
-        .expect("run command")
+    common::run_cli(repo, args)
 }
 
 fn initialized() -> TestRepo {
