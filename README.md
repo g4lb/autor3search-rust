@@ -1,6 +1,6 @@
 # autor3search-rust
 
-[![ci](https://github.com/g4lb/autor3search-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/g4lb/autor3search-rust/actions/workflows/ci.yml?query=branch%3Amain)
+[![ci](https://github.com/autor3search/rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/autor3search/rust/actions/workflows/ci.yml?query=branch%3Amain)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **Autonomous AI-driven performance optimization for any Rust repository.**
@@ -35,7 +35,7 @@ optional**.
 > illustration.
 >
 > What version you get, and what changed in it, is on the
-> [releases page](https://github.com/g4lb/autor3search-rust/releases) — this
+> [releases page](https://github.com/autor3search/rust/releases) — this
 > README describes the current one.
 
 ---
