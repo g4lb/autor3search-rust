@@ -1,7 +1,7 @@
 # autor3search-rust
 
 [![ci](https://github.com/autor3search/rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/autor3search/rust/actions/workflows/ci.yml?query=branch%3Amain)
-[![crates.io](https://img.shields.io/crates/v/autor3search?label=crates.io)](https://crates.io/crates/autor3search)
+[![crates.io](https://img.shields.io/crates/v/autor3search-rust?label=crates.io)](https://crates.io/crates/autor3search-rust)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **Autonomous AI-driven performance optimization for any Rust repository.**
@@ -50,7 +50,7 @@ and paste this:
 Install and run autor3search-rust on this repository, then optimize it.
 
 Setup:
-1. cargo install --locked autor3search
+1. cargo install --locked autor3search-rust
    Make sure ~/.cargo/bin is on PATH.
 2. autor3search-rust init
    Show me the benchmarks it discovered. If it reports none, STOP and tell
@@ -140,7 +140,7 @@ without also erasing whatever real optimization sits next to them — see
 ## Quick start
 
 ```bash
-cargo install --locked autor3search
+cargo install --locked autor3search-rust
 
 cd your-rust-project
 autor3search-rust init                                # find benchmarks, write config + program.md

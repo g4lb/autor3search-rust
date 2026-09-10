@@ -5,8 +5,8 @@
 # One-time setup on crates.io (crate → Settings → Trusted Publishing):
 #   Repository owner: autor3search   Repository name: rust
 #   Workflow filename: release.yml    Environment: (leave blank)
-# The crate must already exist, so the FIRST publish of a new crate name has to
-# be done once from a developer machine with `cargo publish`.
+# Trusted publishing is configured per crate and needs the crate to exist, which
+# `autor3search-rust` already does — so no bootstrap publish is required here.
 #
 # To release: bump `version` in Cargo.toml, commit, then
 #   git tag v<version> && git push origin v<version>
