@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "autor3search-rust"
-version = "0.1.1"
+name = "autor3search"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "glob",

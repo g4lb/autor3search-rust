@@ -1,6 +1,6 @@
 [package]
-name = "autor3search-rust"
-version = "0.1.1"
+name = "autor3search"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
