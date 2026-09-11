@@ -5,10 +5,11 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 description = "Autonomous AI-driven performance optimization for any Rust repository."
+homepage = "https://autor3search.dev"
 repository = "https://github.com/autor3search/rust"
 authors = ["Gal Be <galevgi@gmail.com>"]
 readme = "README.md"
-keywords = ["benchmark", "performance", "optimization", "criterion", "agent"]
+keywords = ["autoresearch", "benchmark", "performance", "criterion", "agent"]
 categories = ["development-tools", "command-line-utilities"]
 # docs/ and .superpowers/ are development material. tests/ and testdata/demo
 # are left out together: cargo always drops a nested package like the demo
