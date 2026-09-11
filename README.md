@@ -4,6 +4,8 @@
 [![crates.io](https://img.shields.io/crates/v/autor3search-rust?label=crates.io)](https://crates.io/crates/autor3search-rust)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+[autoresearch for your codebase](https://autor3search.dev/) — the same loop in seven languages, with every agent prompt in one place.
+
 **Autonomous AI-driven performance optimization for any Rust repository.**
 
 Point your coding agent at your repo and go to sleep. It proposes an
